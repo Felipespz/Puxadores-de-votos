@@ -1,3 +1,16 @@
+# =====================================================================================
+# VERIFICANDO PUXADORES DE VOTOS NAS ÚLTMAS ELEIÇÕES
+# O seguinte código parte da pergunta: a quantidade de puxadores de voto
+# diminuiu nas últimas eleições após a cláusula de desempenho e fim das coligações?
+# 
+# Para isso, são usados dados do TSE sobre eleitos, considerando quem são
+# seus partidos e votos válidos, considerando inclusive coligações e federações.
+#
+# Para fins de totalização, são considerados os parlamentares não eleitos, mas que
+# contribuem para a superação do quociente do partido, e permitem verificar melhor
+# sobre os que puxaram votos e quantos foram efetivamente puxados.
+# =====================================================================================
+
 # Voto no candidato
 {
   # Puxando os dados das planilhas do TSE votacao_candidato_munzona_ANO_BRASIL para voto em candidatos
