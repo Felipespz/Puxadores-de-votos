@@ -1,0 +1,61 @@
+  # Situações que contam como "eleito"
+  situacoes_eleito <- c("ELEITO POR QP", "ELEITO POR MÉDIA", "ELEITO")
+  
+  # Para 2026, o STF manteve a distribuição de 2022 (veto ao PLP 177/2023 ainda pendente).
+  cadeiras_uf <- tribble(
+    ~SG_UF, ~QTD_CADEIRAS_UF,
+    "AC",  8, "AL",  9, "AM",  8, "AP",  8, "BA", 39, "CE", 22, "DF",  8,
+    "ES", 10, "GO", 17, "MA", 18, "MG", 53, "MS",  8, "MT",  8, "PA", 17,
+    "PB", 12, "PE", 25, "PI", 10, "PR", 30, "RJ", 46, "RN",  8, "RO",  8,
+    "RR",  8, "RS", 31, "SC", 16, "SE",  8, "SP", 70, "TO",  8
+  )
+  stopifnot(sum(cadeiras_uf$QTD_CADEIRAS_UF) == 513)
+  
+  # Regras que mudam entre eleições (para uso descritivo e na futura simulação).
+  
+  #  - LIMIAR_INDIV_QP: votação nominal mínima do candidato, em fração do QE, para ocupar
+  #    vaga obtida por QP (art. 108 CE; Lei 13.165/2015, vigente a partir de 2018).
+  #  - LIMIAR_INDIV_SOBRAS: idem para as sobras (10% em 2018; 20% a partir de 2022, Lei 14.211/2021).
+  #  - LIMIAR_AGRUP_SOBRAS: votação mínima do partido/federação, em fração do QE, para
+  #    disputar a 1ª rodada de sobras (80% a partir de 2022, Lei 14.211/2021).
+  #  - SOBRAS_SO_QUEM_FEZ_QE: em 2014 só disputava sobras quem atingiu o QE
+  #    (art. 109 §2º, redação anterior à Lei 13.488/2017).
+  #  - FASE_FINAL_SOBRAS_TODOS: na etapa final das sobras, todos os partidos/federações
+  #    participam. Para 2022 isso vale por decisão do STF (ADIs 7228 e 7263): a restrição
+  #    80/20 na etapa final foi derrubada em 2024 e, em março de 2025, o STF decidiu que a
+  #    decisão se aplica a 2022, o que levou à retotalização em AP, DF, RO e TO.
+  #  - COLIGACAO_PROPORCIONAL: coligações proporcionais permitidas (fim pela EC 97/2017, a partir de 2020).
+  #  - CLAUSULA_DESEMP_PCT / CLAUSULA_DESEMP_DEP: cláusula de desempenho da EC 97/2017
+  #    (não afeta a distribuição de cadeiras; só acesso a fundo partidário e tempo de TV).
+  regras_ano <- tribble(
+    ~ANO_ELEICAO, ~COLIGACAO_PROPORCIONAL, ~LIMIAR_INDIV_QP, ~LIMIAR_INDIV_SOBRAS, ~LIMIAR_AGRUP_SOBRAS, ~SOBRAS_SO_QUEM_FEZ_QE, ~FASE_FINAL_SOBRAS_TODOS, ~CLAUSULA_DESEMP_PCT, ~CLAUSULA_DESEMP_DEP,
+    2014,         TRUE,                    0.00,             0.00,                 1.00,                 TRUE,                   FALSE,                    NA,                   NA,
+    2018,         TRUE,                    0.10,             0.10,                 0.00,                 FALSE,                  TRUE,                     1.5,                  9,
+    2022,         FALSE,                   0.10,             0.20,                 0.80,                 FALSE,                  TRUE,                     2.0,                  11,
+    2026,         FALSE,                   0.10,             0.20,                 0.80,                 FALSE,                  TRUE,                     2.5,                  13
+  )
+  
+  # Converte códigos numéricos longos (SQ_*) em texto sem notação científica.
+  para_texto <- function(x) trimws(format(x, scientific = FALSE, trim = TRUE))
+  
+  # Lista de valores que descrevem parlamentares de partidos não associados 
+  # a uma coligação (2014-2018) ou federação (2022-2026)
+  valores_isolado <- c("PARTIDO ISOLADO", "FEDERAÇÃO ISOLADA", "#NULO#", "#NE#", "", NA)
+  
+  # Função para definir o agrupamento eleitoral
+  define_agrupamento <- function(df) {
+    df |>
+      mutate(
+        AGRUPAMENTO_COD = AGRUPAMENTO_COD,
+        EM_COLIGACAO_OU_FEDERACAO = !(AGRUPAMENTO_ORIG %in% valores_isolado) &
+          !(AGRUPAMENTO_COD %in% c(NA, "", "-1", "-3", "0")),
+        # Chave: COL_<SQ_COLIGACAO> / FED_<NR_FEDERACAO>, ou PART_<SG_PARTIDO> para isolados
+        AGRUPAMENTO_ID = if_else(
+          EM_COLIGACAO_OU_FEDERACAO,
+          paste0(if_else(ANO_ELEICAO <= 2018, "COL_", "FED_"), AGRUPAMENTO_COD),
+          paste0("PART_", SG_PARTIDO)
+        ),
+        # Nome legível (mesma variável da versão original)
+        AGRUPAMENTO_ELEITORAL = if_else(EM_COLIGACAO_OU_FEDERACAO, AGRUPAMENTO_ORIG, SG_PARTIDO)
+      )
+  }
