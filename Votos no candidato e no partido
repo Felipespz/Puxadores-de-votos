@@ -1,0 +1,262 @@
+# Voto no candidato
+{
+  # Puxando os dados das planilhas do TSE votacao_candidato_munzona_ANO_BRASIL para voto em candidatos
+  # disponíveis no endpoint https://dadosabertos.tse.jus.br/dataset/resultados-ANO
+  
+  resultados_2014 <- fread(file = "C:/Users/controladoria/Downloads/votacao_candidato_munzona_2014_BRASIL.csv",
+                           sep = ";",
+                           dec = ",",
+                           encoding = "Latin-1")
+  resultados_2018 <- fread(file = "C:/Users/controladoria/Downloads/votacao_candidato_munzona_2018_BRASIL.csv",
+                           sep = ";",
+                           dec = ",",
+                           encoding = "Latin-1")
+  resultados_2022 <- fread(file = "C:/Users/controladoria/Downloads/votacao_candidato_munzona_2022_BRASIL.csv",
+                           sep = ";",
+                           dec = ",",
+                           encoding = "Latin-1")
+  resultados_2026 <- fread(file = "C:/Users/controladoria/Downloads/votacao_candidato_munzona_2026_BRASIL.csv",
+                           sep = ";",
+                           dec = ",",
+                           encoding = "Latin-1")
+  
+  # Filtrando apenas deputados federais eleitos
+  # Selecionando as variáveis de interesse para identificação da eleição e do parlamentar
+  # se estava em coligação ou federação, e quantos votos fez ao todo
+  
+  resultados_2014_filtrado <- resultados_2014 |>
+    filter(DS_SIT_TOT_TURNO %in% situacoes_eleito & CD_CARGO == 6) |>
+    select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, NM_MUNICIPIO, SG_UF, SQ_COLIGACAO, NM_COLIGACAO, DS_SIT_TOT_TURNO, QT_VOTOS_NOMINAIS, ST_VOTO_EM_TRANSITO)
+  resultados_2018_filtrado <- resultados_2018 |>
+    filter(DS_SIT_TOT_TURNO %in% situacoes_eleito & CD_CARGO == 6) |>
+    select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, NM_MUNICIPIO, SG_UF, SQ_COLIGACAO, NM_COLIGACAO, DS_SIT_TOT_TURNO, QT_VOTOS_NOMINAIS_VALIDOS, ST_VOTO_EM_TRANSITO)
+  resultados_2022_filtrado <- resultados_2022 |>
+    filter(DS_SIT_TOT_TURNO %in% situacoes_eleito & CD_CARGO == 6) |>
+    select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, NM_MUNICIPIO, SG_UF, NR_FEDERACAO, NM_FEDERACAO, DS_SIT_TOT_TURNO, QT_VOTOS_NOMINAIS_VALIDOS, ST_VOTO_EM_TRANSITO)
+  resultados_2026_filtrado <- resultados_2026 |>
+    filter(DS_SIT_TOT_TURNO %in% situacoes_eleito & CD_CARGO == 6) |>
+    select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, NM_MUNICIPIO, SG_UF, NR_FEDERACAO, NM_FEDERACAO, DS_SIT_TOT_TURNO, QT_VOTOS_NOMINAIS_VALIDOS, ST_VOTO_EM_TRANSITO)
+  
+  # Unificando a base
+  
+  base_unificada <- bind_rows(
+    resultados_2014_filtrado |>
+      mutate(SQ_COLIGACAO = para_texto(SQ_COLIGACAO)) |>
+      rename(AGRUPAMENTO_ORIG = NM_COLIGACAO, AGRUPAMENTO_COD = SQ_COLIGACAO, VOTOS = QT_VOTOS_NOMINAIS),
+    
+    resultados_2018_filtrado |>
+      mutate(SQ_COLIGACAO = para_texto(SQ_COLIGACAO)) |>
+      rename(AGRUPAMENTO_ORIG = NM_COLIGACAO, AGRUPAMENTO_COD = SQ_COLIGACAO, VOTOS = QT_VOTOS_NOMINAIS_VALIDOS),
+    
+    resultados_2022_filtrado |>
+      mutate(NR_FEDERACAO = para_texto(NR_FEDERACAO)) |>
+      rename(AGRUPAMENTO_ORIG = NM_FEDERACAO, AGRUPAMENTO_COD = NR_FEDERACAO, VOTOS = QT_VOTOS_NOMINAIS_VALIDOS),
+    
+    resultados_2026_filtrado |>
+      mutate(NR_FEDERACAO = para_texto(NR_FEDERACAO)) |>
+      rename(AGRUPAMENTO_ORIG = NM_FEDERACAO, AGRUPAMENTO_COD = NR_FEDERACAO, VOTOS = QT_VOTOS_NOMINAIS_VALIDOS)
+  ) |>
+    mutate(SQ_CANDIDATO = para_texto(SQ_CANDIDATO))
+  
+  # Verificando se aparecem os 513 deputados eleitos no pleito
+  
+  verificacao_eleitos <- base_unificada |>
+    group_by(ANO_ELEICAO) |>
+    summarise(
+      qtd_nomes_unicos = n_distinct(NM_CANDIDATO),
+      qtd_sq_candidato_unicos = n_distinct(SQ_CANDIDATO),
+      .groups = "drop"
+    )
+  
+  print(verificacao_eleitos)
+  
+  # Processo de verificação dos deputados com mais votos no estado
+  
+  deputados_consolidados <- base_unificada |>
+    
+    # 1. Soma os votos de todas as zonas/municípios para ter o total do candidato na UF
+    group_by(
+      ANO_ELEICAO, SG_UF, SQ_CANDIDATO, NM_CANDIDATO,
+      SG_PARTIDO, AGRUPAMENTO_ORIG, AGRUPAMENTO_COD, DS_SIT_TOT_TURNO
+    ) |>
+    summarise(
+      TOTAL_VOTOS = sum(VOTOS, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    
+    # 2. Cria a chave de agrupamento: se for Partido Isolado (ou sem federação), usa o SG_PARTIDO;
+    #    se fizer parte de Coligação ou Federação, usa o nome da Coligação/Federação
+    define_agrupamento() |>
+    
+    # 3. Ordena por Ano -> Estado -> Coligação/Partido -> Quantidade de Votos (do maior para o menor)
+    arrange(
+      ANO_ELEICAO,
+      SG_UF,
+      AGRUPAMENTO_ELEITORAL,
+      desc(TOTAL_VOTOS)
+    )
+}
+
+# Voto na legenda
+{
+  # Puxando os dados das planilhas do TSE votacao_partido_munzona_ANO_BRASIL para voto em legenda
+  # disponíveis no endpoint https://dadosabertos.tse.jus.br/dataset/resultados-ANO
+  
+  resultados_2014_partido <- fread(file = "C:/Users/controladoria/Downloads/votacao_partido_munzona_2014_BRASIL.csv",
+                           sep = ";",
+                           dec = ",",
+                           encoding = "Latin-1")
+  resultados_2018_partido <- fread(file = "C:/Users/controladoria/Downloads/votacao_partido_munzona_2018_BRASIL.csv",
+                           sep = ";",
+                           dec = ",",
+                           encoding = "Latin-1")
+  resultados_2022_partido <- fread(file = "C:/Users/controladoria/Downloads/votacao_partido_munzona_2022_BRASIL.csv",
+                           sep = ";",
+                           dec = ",",
+                           encoding = "Latin-1")
+  resultados_2026_partido <- fread(file = "C:/Users/controladoria/Downloads/votacao_partido_munzona_2026_BRASIL.csv",
+                           sep = ";",
+                           dec = ",",
+                           encoding = "Latin-1")
+  
+  # Unificando os votos conferidos em legenda
+  
+  legenda_unificada <- bind_rows(
+    resultados_2014_partido |> filter(CD_CARGO == 6) |> select(ANO_ELEICAO, SG_UF, SG_PARTIDO, VOTOS_LEG = QT_VOTOS_LEGENDA),
+    resultados_2018_partido |> filter(CD_CARGO == 6) |> select(ANO_ELEICAO, SG_UF, SG_PARTIDO, VOTOS_LEG = QT_TOTAL_VOTOS_LEG_VALIDOS),
+    resultados_2022_partido |> filter(CD_CARGO == 6) |> select(ANO_ELEICAO, SG_UF, SG_PARTIDO, VOTOS_LEG = QT_TOTAL_VOTOS_LEG_VALIDOS),
+    resultados_2026_partido |> filter(CD_CARGO == 6) |> select(ANO_ELEICAO, SG_UF, SG_PARTIDO, VOTOS_LEG = QT_TOTAL_VOTOS_LEG_VALIDOS)
+  ) |>
+    group_by(ANO_ELEICAO, SG_UF, SG_PARTIDO) |>
+    summarise(
+      QTD_VOTOS_LEGENDA_PARTIDO = sum(VOTOS_LEG, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Empilhando as bases BRUTAS filtrando apenas Deputado Federal (CD_CARGO == 6)
+  # Removemos apenas registros sem efeito no turno (#NULO# em DS_SIT_TOT_TURNO são candidatos indeferidos/renúncia)
+  # São considerados os listados como "NÃO ELEITO" para fins de cálculo do quociente
+  candidatos_todos <- bind_rows(
+    resultados_2014 |> 
+      filter(CD_CARGO == 6, !DS_SIT_TOT_TURNO %in% c("#NULO#", "")) |>
+      mutate(SQ_COLIGACAO = para_texto(SQ_COLIGACAO)) |>
+      select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, SG_UF, 
+             AGRUPAMENTO_ORIG = NM_COLIGACAO, AGRUPAMENTO_COD = SQ_COLIGACAO, DS_SIT_TOT_TURNO, VOTOS = QT_VOTOS_NOMINAIS),
+    
+    resultados_2018 |> 
+      filter(CD_CARGO == 6, !DS_SIT_TOT_TURNO %in% c("#NULO#", "")) |>
+      mutate(SQ_COLIGACAO = para_texto(SQ_COLIGACAO)) |>
+      select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, SG_UF, 
+             AGRUPAMENTO_ORIG = NM_COLIGACAO, AGRUPAMENTO_COD = SQ_COLIGACAO, DS_SIT_TOT_TURNO, VOTOS = QT_VOTOS_NOMINAIS_VALIDOS),
+    
+    resultados_2022 |> 
+      filter(CD_CARGO == 6, !DS_SIT_TOT_TURNO %in% c("#NULO#", "")) |>
+      mutate(NR_FEDERACAO = para_texto(NR_FEDERACAO)) |>
+      select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, SG_UF, 
+             AGRUPAMENTO_ORIG = NM_FEDERACAO, AGRUPAMENTO_COD = NR_FEDERACAO, DS_SIT_TOT_TURNO, VOTOS = QT_VOTOS_NOMINAIS_VALIDOS),
+    
+    resultados_2026 |> 
+      filter(CD_CARGO == 6, !DS_SIT_TOT_TURNO %in% c("#NULO#", "")) |>
+      mutate(NR_FEDERACAO = para_texto(NR_FEDERACAO)) |>
+      select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, SG_UF, 
+             AGRUPAMENTO_ORIG = NM_FEDERACAO, AGRUPAMENTO_COD = NR_FEDERACAO, DS_SIT_TOT_TURNO, VOTOS = QT_VOTOS_NOMINAIS_VALIDOS)
+  ) |>
+    mutate(SQ_CANDIDATO = para_texto(SQ_CANDIDATO)) |>
+    # Soma os votos nominais de cada candidato no estado (munzona -> UF)
+    group_by(ANO_ELEICAO, SG_UF, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, AGRUPAMENTO_ORIG, AGRUPAMENTO_COD, DS_SIT_TOT_TURNO) |>
+    summarise(
+      VOTOS_NOMINAIS_CANDIDATO = sum(VOTOS, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    # Define o agrupamento eleitoral (Coligação/Federação ou Partido Isolado)
+    define_agrupamento()
+  
+  # Calculo do Quociente Eleitoral (QE) Exato por UF e o Total por Partido/Coligação
+  
+    # 4.1 Total de votos de legenda por UF
+    legenda_uf <- legenda_unificada |>
+      group_by(ANO_ELEICAO, SG_UF) |>
+      summarise(TOTAL_LEGENDA_UF = sum(QTD_VOTOS_LEGENDA_PARTIDO, na.rm = TRUE), .groups = "drop")
+    
+    # 4.2 Cálculo do Quociente Eleitoral Exato por Ano e UF
+    quociente_uf <- candidatos_todos |>
+      group_by(ANO_ELEICAO, SG_UF) |>
+      summarise(
+        TOTAL_NOMINAIS_UF = sum(VOTOS_NOMINAIS_CANDIDATO, na.rm = TRUE),
+        # Conta quantas cadeiras existem no estado (total de deputados eleitos na UF)
+        QTD_ELEITOS_OBSERVADOS = n_distinct(SQ_CANDIDATO[DS_SIT_TOT_TURNO %in% situacoes_eleito]),
+        .groups = "drop"
+      ) |>
+      left_join(cadeiras_uf, by = "SG_UF") |>
+      left_join(legenda_uf, by = c("ANO_ELEICAO", "SG_UF")) |>
+      mutate(
+        TOTAL_LEGENDA_UF = coalesce(TOTAL_LEGENDA_UF, 0),
+        VOTOS_VALIDOS_UF = TOTAL_NOMINAIS_UF + TOTAL_LEGENDA_UF,
+        QE_BRUTO = VOTOS_VALIDOS_UF / QTD_CADEIRAS_UF,
+        # Regra do Art. 106 do Código Eleitoral: fração <= 0.5 despreza; > 0.5 arredonda para cima
+        QUOCIENTE_ELEITORAL = if_else((QE_BRUTO %% 1) > 0.5, ceiling(QE_BRUTO), floor(QE_BRUTO))
+      )
+    
+    # 4.3 Votos totais do Partido e da Coligação/Federação (incluindo Não Eleitos e Legenda)
+    # Partidos com candidato válido: agrupamento vem do arquivo de candidato (já validado)
+    mapa_candidatos <- candidatos_todos |>
+      distinct(ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ID, AGRUPAMENTO_ELEITORAL)
+    
+    # Partidos sem candidato válido (só voto de legenda): agrupamento vem do arquivo de partido.
+    # Se o partido tiver mais de uma marcação nesse arquivo, prevalece a coligação/federação
+    # sobre "isolado" (linhas com #NULO#/PARTIDO ISOLADO costumam ser falta de preenchimento)
+    mapa_partido <- bind_rows(
+      resultados_2014_partido |> filter(CD_CARGO == 6) |>
+        distinct(ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ORIG = NM_COLIGACAO, AGRUPAMENTO_COD = para_texto(SQ_COLIGACAO)),
+      resultados_2018_partido |> filter(CD_CARGO == 6) |>
+        distinct(ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ORIG = NM_COLIGACAO, AGRUPAMENTO_COD = para_texto(SQ_COLIGACAO)),
+      resultados_2022_partido |> filter(CD_CARGO == 6) |>
+        distinct(ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ORIG = NM_FEDERACAO, AGRUPAMENTO_COD = para_texto(NR_FEDERACAO)),
+      resultados_2026_partido |> filter(CD_CARGO == 6) |>
+        distinct(ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ORIG = NM_FEDERACAO, AGRUPAMENTO_COD = para_texto(NR_FEDERACAO))
+    ) |>
+      define_agrupamento() |>
+      distinct(ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ID, AGRUPAMENTO_ELEITORAL) |>
+      anti_join(mapa_candidatos, by = c("ANO_ELEICAO", "SG_UF", "SG_PARTIDO")) |>
+      group_by(ANO_ELEICAO, SG_UF, SG_PARTIDO) |>
+      mutate(N_AGRUP_DISTINTOS = n_distinct(AGRUPAMENTO_ID[!startsWith(AGRUPAMENTO_ID, "PART_")])) |>
+      arrange(startsWith(AGRUPAMENTO_ID, "PART_"), .by_group = TRUE) |>
+      slice(1) |>
+      ungroup()
+    
+    # Conferindo se um mesmo partido é marcado em duas coligações/federações DIFERENTES na mesma UF
+    conflitos_agrupamento <- filter(mapa_partido, N_AGRUP_DISTINTOS > 1)
+    if (nrow(conflitos_agrupamento) > 0) {
+      print(conflitos_agrupamento)
+      stop("Partido em mais de uma coligação/federação na mesma UF: conferir manualmente")
+    }
+    
+    votos_agrupamento <- candidatos_todos |>
+      group_by(ANO_ELEICAO, SG_UF, SG_PARTIDO) |>
+      summarise(VOTOS_NOMINAIS_PARTIDO = sum(VOTOS_NOMINAIS_CANDIDATO, na.rm = TRUE), .groups = "drop") |>
+      full_join(legenda_unificada, by = c("ANO_ELEICAO", "SG_UF", "SG_PARTIDO")) |>
+      left_join(mapa_agrupamento, by = c("ANO_ELEICAO", "SG_UF", "SG_PARTIDO")) |>
+      mutate(
+        VOTOS_NOMINAIS_PARTIDO = coalesce(VOTOS_NOMINAIS_PARTIDO, 0),
+        QTD_VOTOS_LEGENDA = coalesce(QTD_VOTOS_LEGENDA_PARTIDO, 0),
+        VOTOS_TOTAIS_PARTIDO = VOTOS_NOMINAIS_PARTIDO + QTD_VOTOS_LEGENDA
+      ) |>
+      group_by(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID) |>
+      mutate(
+        QTD_VOTOS_LEGENDA_AGRUPAMENTO = sum(QTD_VOTOS_LEGENDA),
+        VOTOS_TOTAIS_AGRUPAMENTO = sum(VOTOS_TOTAIS_PARTIDO)
+      ) |>
+      ungroup()
+    
+    mapa_agrupamento <- bind_rows(
+      mapa_candidatos,
+      select(mapa_partido, ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ID, AGRUPAMENTO_ELEITORAL)
+    )
+    
+    # Cada partido precisa ter um único agrupamento por UF/ano
+    duplicados <- mapa_agrupamento |> group_by(ANO_ELEICAO, SG_UF, SG_PARTIDO) |> filter(n() > 1)
+    if (nrow(duplicados) > 0) {
+      print(duplicados)
+      stop("Partido com mais de um agrupamento na mesma UF")
+    }
+}
