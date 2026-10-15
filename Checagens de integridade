@@ -1,0 +1,77 @@
+# =====================================================================================
+# CHECAGENS DE INTEGRIDADE
+# Todas as tabelas abaixo deveriam sair vazias (0 linhas). Linhas = algo a investigar.
+# =====================================================================================
+{
+# Checagem 1: eleitos por UF batem com a tabela fixa de cadeiras?
+checagem_cadeiras <- quociente_uf |>
+  filter(QTD_ELEITOS_OBSERVADOS != QTD_CADEIRAS_UF | is.na(QTD_CADEIRAS_UF)) |>
+  select(ANO_ELEICAO, SG_UF, QTD_CADEIRAS_UF, QTD_ELEITOS_OBSERVADOS)
+print(checagem_cadeiras)
+
+# Checagem 2: situações não previstas (ex.: problema de encoding em "ELEITO POR MÉDIA")
+situacoes_conhecidas <- c(situacoes_eleito, "SUPLENTE", "NÃO ELEITO", "#NULO#", "")
+checagem_situacoes <- bind_rows(
+  resultados_2014 |> filter(CD_CARGO == 6) |> distinct(ANO_ELEICAO, DS_SIT_TOT_TURNO),
+  resultados_2018 |> filter(CD_CARGO == 6) |> distinct(ANO_ELEICAO, DS_SIT_TOT_TURNO),
+  resultados_2022 |> filter(CD_CARGO == 6) |> distinct(ANO_ELEICAO, DS_SIT_TOT_TURNO),
+  resultados_2026 |> filter(CD_CARGO == 6) |> distinct(ANO_ELEICAO, DS_SIT_TOT_TURNO)
+) |>
+  filter(!DS_SIT_TOT_TURNO %in% situacoes_conhecidas)
+print(checagem_situacoes)
+
+# Checagem 3: nominais do arquivo de candidato x nominais do arquivo de partido, por partido/UF.
+# Em 2014 (sem coluna de válidos), diferenças apontam onde há votos anulados ou de
+# candidatos #NULO# — é a lista de partidos/UFs para a conferência manual.
+# A coluna de nominais do arquivo de partido é escolhida conforme o que existir no arquivo.
+nominais_partido_arquivo <- function(df) {
+  col <- intersect(c("QT_VOTOS_NOMINAIS_VALIDOS", "QT_VOTOS_NOMINAIS"), names(df))[1]
+  df |>
+    filter(CD_CARGO == 6) |>
+    group_by(ANO_ELEICAO, SG_UF, SG_PARTIDO) |>
+    summarise(NOMINAIS_ARQ_PARTIDO = sum(.data[[col]], na.rm = TRUE), .groups = "drop")
+}
+checagem_nominais <- bind_rows(
+  nominais_partido_arquivo(resultados_2014_partido),
+  nominais_partido_arquivo(resultados_2018_partido),
+  nominais_partido_arquivo(resultados_2022_partido),
+  nominais_partido_arquivo(resultados_2026_partido)
+) |>
+  full_join(
+    candidatos_todos |>
+      group_by(ANO_ELEICAO, SG_UF, SG_PARTIDO) |>
+      summarise(NOMINAIS_ARQ_CANDIDATO = sum(VOTOS_NOMINAIS_CANDIDATO), .groups = "drop"),
+    by = c("ANO_ELEICAO", "SG_UF", "SG_PARTIDO")
+  ) |>
+  mutate(DIFERENCA = coalesce(NOMINAIS_ARQ_CANDIDATO, 0) - coalesce(NOMINAIS_ARQ_PARTIDO, 0)) |>
+  filter(DIFERENCA != 0) |>
+  arrange(ANO_ELEICAO, desc(abs(DIFERENCA)))
+print(checagem_nominais)
+
+# Checagem 4: cada AGRUPAMENTO_ID corresponde a um único nome (e vice-versa) dentro da UF?
+checagem_agrupamento <- candidatos_todos |>
+  distinct(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID, AGRUPAMENTO_ELEITORAL) |>
+  group_by(ANO_ELEICAO, SG_UF) |>
+  filter(duplicated(AGRUPAMENTO_ID) | duplicated(AGRUPAMENTO_ELEITORAL)) |>
+  ungroup()
+print(checagem_agrupamento)
+
+# Checagem 5: retotalização de 2022 (STF, ADIs 7228/7263). Em julho de 2025 a Câmara trocou
+# 7 deputados (AP, DF, RO, TO). Se o arquivo do TSE for anterior à retotalização,
+# os eleitos dessas UFs refletem o resultado original. Confira DT_GERACAO e a lista:
+#   saíram: Silvia Waiãpi, Sonize Barbosa, Professora Goreth, Augusto Puppio (AP),
+#           Gilvan Máximo (DF), Lebrão (RO), Lázaro Botelho (TO)
+#   entraram: Paulo Lemos, André Abdon, Aline Gurgel, Professora Marcivania (AP),
+#             Rodrigo Rollemberg (DF), Rafael Fera (RO), Tiago Dimas (TO)
+# Nomes de urna; NM_CANDIDATO traz o nome civil, então confira pelo SQ_CANDIDATO se preciso.
+if ("DT_GERACAO" %in% names(resultados_2022)) print(unique(resultados_2022$DT_GERACAO))
+planilha_deputados_final |>
+  filter(ANO_ELEICAO == 2022, SG_UF %in% c("AP", "DF", "RO", "TO")) |>
+  select(SG_UF, NM_CANDIDATO, SG_PARTIDO, DS_SIT_TOT_TURNO, VOTOS_NOMINAIS_CANDIDATO) |>
+  print(n = Inf)
+
+# Checagem 6: joins sem correspondência (QE ou votos do agrupamento ausentes)
+checagem_na <- planilha_deputados_final |>
+  filter(is.na(QUOCIENTE_ELEITORAL) | is.na(VOTOS_TOTAIS_AGRUPAMENTO))
+print(checagem_na)
+}
