@@ -2,6 +2,7 @@
 # CHECAGENS DE INTEGRIDADE
 # Todas as tabelas abaixo deveriam sair vazias (0 linhas). Linhas = algo a investigar.
 # =====================================================================================
+
 {
 # Checagem 1: eleitos por UF batem com a tabela fixa de cadeiras?
 checagem_cadeiras <- quociente_uf |>
