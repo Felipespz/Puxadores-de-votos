@@ -1,0 +1,758 @@
+library(tidyverse)
+library(writexl)
+library(data.table)
+
+# =====================================================================================
+# VERIFICANDO PUXADORES DE VOTOS NAS ÚLTMAS ELEIÇÕES
+# O seguinte código parte da pergunta: a quantidade de puxadores de voto
+# diminuiu nas últimas eleições após a cláusula de desempenho e fim das coligações?
+# 
+# Para isso, são usados dados do TSE sobre eleitos, considerando quem são
+# seus partidos e votos válidos, considerando inclusive coligações e federações.
+#
+# Para fins de totalização, são considerados os parlamentares não eleitos, mas que
+# contribuem para a superação do quociente do partido, e permitem verificar melhor
+# sobre os que puxaram votos e quantos foram efetivamente puxados.
+# =====================================================================================
+
+# Definindo funções e variáveis exógenas ao banco do TSE
+{
+  # Situações que contam como "eleito"
+  situacoes_eleito <- c("ELEITO POR QP", "ELEITO POR MÉDIA", "ELEITO")
+  
+  # Para 2026, o STF manteve a distribuição de 2022 (veto ao PLP 177/2023 ainda pendente).
+  cadeiras_uf <- tribble(
+    ~SG_UF, ~QTD_CADEIRAS_UF,
+    "AC",  8, "AL",  9, "AM",  8, "AP",  8, "BA", 39, "CE", 22, "DF",  8,
+    "ES", 10, "GO", 17, "MA", 18, "MG", 53, "MS",  8, "MT",  8, "PA", 17,
+    "PB", 12, "PE", 25, "PI", 10, "PR", 30, "RJ", 46, "RN",  8, "RO",  8,
+    "RR",  8, "RS", 31, "SC", 16, "SE",  8, "SP", 70, "TO",  8
+  )
+  stopifnot(sum(cadeiras_uf$QTD_CADEIRAS_UF) == 513)
+  
+  # Regras que mudam entre eleições (para uso descritivo e na futura simulação).
+  
+  #  - LIMIAR_INDIV_QP: votação nominal mínima do candidato, em fração do QE, para ocupar
+  #    vaga obtida por QP (art. 108 CE; Lei 13.165/2015, vigente a partir de 2018).
+  #  - LIMIAR_INDIV_SOBRAS: idem para as sobras (10% em 2018; 20% a partir de 2022, Lei 14.211/2021).
+  #  - LIMIAR_AGRUP_SOBRAS: votação mínima do partido/federação, em fração do QE, para
+  #    disputar a 1ª rodada de sobras (80% a partir de 2022, Lei 14.211/2021).
+  #  - SOBRAS_SO_QUEM_FEZ_QE: em 2014 só disputava sobras quem atingiu o QE
+  #    (art. 109 §2º, redação anterior à Lei 13.488/2017).
+  #  - FASE_FINAL_SOBRAS_TODOS: na etapa final das sobras, todos os partidos/federações
+  #    participam. Para 2022 isso vale por decisão do STF (ADIs 7228 e 7263): a restrição
+  #    80/20 na etapa final foi derrubada em 2024 e, em março de 2025, o STF decidiu que a
+  #    decisão se aplica a 2022, o que levou à retotalização em AP, DF, RO e TO.
+  #  - COLIGACAO_PROPORCIONAL: coligações proporcionais permitidas (fim pela EC 97/2017, a partir de 2020).
+  #  - CLAUSULA_DESEMP_PCT / CLAUSULA_DESEMP_DEP: cláusula de desempenho da EC 97/2017
+  #    (não afeta a distribuição de cadeiras; só acesso a fundo partidário e tempo de TV).
+  regras_ano <- tribble(
+    ~ANO_ELEICAO, ~COLIGACAO_PROPORCIONAL, ~LIMIAR_INDIV_QP, ~LIMIAR_INDIV_SOBRAS, ~LIMIAR_AGRUP_SOBRAS, ~SOBRAS_SO_QUEM_FEZ_QE, ~FASE_FINAL_SOBRAS_TODOS, ~CLAUSULA_DESEMP_PCT, ~CLAUSULA_DESEMP_DEP,
+    2014,         TRUE,                    0.00,             0.00,                 1.00,                 TRUE,                   FALSE,                    NA,                   NA,
+    2018,         TRUE,                    0.10,             0.10,                 0.00,                 FALSE,                  TRUE,                     1.5,                  9,
+    2022,         FALSE,                   0.10,             0.20,                 0.80,                 FALSE,                  TRUE,                     2.0,                  11,
+    2026,         FALSE,                   0.10,             0.20,                 0.80,                 FALSE,                  TRUE,                     2.5,                  13
+  )
+  
+  # Converte códigos numéricos longos (SQ_*) em texto sem notação científica.
+  para_texto <- function(x) trimws(format(x, scientific = FALSE, trim = TRUE))
+  
+  # Lista de valores que descrevem parlamentares de partidos não associados 
+  # a uma coligação (2014-2018) ou federação (2022-2026)
+  valores_isolado <- c("PARTIDO ISOLADO", "FEDERAÇÃO ISOLADA", "#NULO#", "#NE#", "", NA)
+  
+  # Função para definir o agrupamento eleitoral
+  define_agrupamento <- function(df) {
+    df |>
+      mutate(
+        AGRUPAMENTO_COD = AGRUPAMENTO_COD,
+        EM_COLIGACAO_OU_FEDERACAO = !(AGRUPAMENTO_ORIG %in% valores_isolado) &
+          !(AGRUPAMENTO_COD %in% c(NA, "", "-1", "-3", "0")),
+        # Chave: COL_<SQ_COLIGACAO> / FED_<NR_FEDERACAO>, ou PART_<SG_PARTIDO> para isolados
+        AGRUPAMENTO_ID = if_else(
+          EM_COLIGACAO_OU_FEDERACAO,
+          paste0(if_else(ANO_ELEICAO <= 2018, "COL_", "FED_"), AGRUPAMENTO_COD),
+          paste0("PART_", SG_PARTIDO)
+        ),
+        # Nome legível (mesma variável da versão original)
+        AGRUPAMENTO_ELEITORAL = if_else(EM_COLIGACAO_OU_FEDERACAO, AGRUPAMENTO_ORIG, SG_PARTIDO)
+      )
+  }
+}
+
+# Voto no candidato
+{
+  # Puxando os dados das planilhas do TSE votacao_candidato_munzona_ANO_BRASIL para voto em candidatos
+  # disponíveis no endpoint https://dadosabertos.tse.jus.br/dataset/resultados-ANO
+  
+  resultados_2014 <- fread(file = "C:/Users/controladoria/Downloads/votacao_candidato_munzona_2014_BRASIL.csv",
+                           sep = ";",
+                           dec = ",",
+                           encoding = "Latin-1")
+  resultados_2018 <- fread(file = "C:/Users/controladoria/Downloads/votacao_candidato_munzona_2018_BRASIL.csv",
+                           sep = ";",
+                           dec = ",",
+                           encoding = "Latin-1")
+  resultados_2022 <- fread(file = "C:/Users/controladoria/Downloads/votacao_candidato_munzona_2022_BRASIL.csv",
+                           sep = ";",
+                           dec = ",",
+                           encoding = "Latin-1")
+  resultados_2026 <- fread(file = "C:/Users/controladoria/Downloads/votacao_candidato_munzona_2026_BRASIL.csv",
+                           sep = ";",
+                           dec = ",",
+                           encoding = "Latin-1")
+  
+  # Filtrando apenas deputados federais eleitos
+  # Selecionando as variáveis de interesse para identificação da eleição e do parlamentar
+  # se estava em coligação ou federação, e quantos votos fez ao todo
+  
+  resultados_2014_filtrado <- resultados_2014 |>
+    filter(DS_SIT_TOT_TURNO %in% situacoes_eleito & CD_CARGO == 6) |>
+    select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, NM_MUNICIPIO, SG_UF, SQ_COLIGACAO, NM_COLIGACAO, DS_SIT_TOT_TURNO, QT_VOTOS_NOMINAIS, ST_VOTO_EM_TRANSITO)
+  resultados_2018_filtrado <- resultados_2018 |>
+    filter(DS_SIT_TOT_TURNO %in% situacoes_eleito & CD_CARGO == 6) |>
+    select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, NM_MUNICIPIO, SG_UF, SQ_COLIGACAO, NM_COLIGACAO, DS_SIT_TOT_TURNO, QT_VOTOS_NOMINAIS_VALIDOS, ST_VOTO_EM_TRANSITO)
+  resultados_2022_filtrado <- resultados_2022 |>
+    filter(DS_SIT_TOT_TURNO %in% situacoes_eleito & CD_CARGO == 6) |>
+    select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, NM_MUNICIPIO, SG_UF, NR_FEDERACAO, NM_FEDERACAO, DS_SIT_TOT_TURNO, QT_VOTOS_NOMINAIS_VALIDOS, ST_VOTO_EM_TRANSITO)
+  resultados_2026_filtrado <- resultados_2026 |>
+    filter(DS_SIT_TOT_TURNO %in% situacoes_eleito & CD_CARGO == 6) |>
+    select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, NM_MUNICIPIO, SG_UF, NR_FEDERACAO, NM_FEDERACAO, DS_SIT_TOT_TURNO, QT_VOTOS_NOMINAIS_VALIDOS, ST_VOTO_EM_TRANSITO)
+  
+  # Unificando a base
+  
+  base_unificada <- bind_rows(
+    resultados_2014_filtrado |>
+      mutate(SQ_COLIGACAO = para_texto(SQ_COLIGACAO)) |>
+      rename(AGRUPAMENTO_ORIG = NM_COLIGACAO, AGRUPAMENTO_COD = SQ_COLIGACAO, VOTOS = QT_VOTOS_NOMINAIS),
+    
+    resultados_2018_filtrado |>
+      mutate(SQ_COLIGACAO = para_texto(SQ_COLIGACAO)) |>
+      rename(AGRUPAMENTO_ORIG = NM_COLIGACAO, AGRUPAMENTO_COD = SQ_COLIGACAO, VOTOS = QT_VOTOS_NOMINAIS_VALIDOS),
+    
+    resultados_2022_filtrado |>
+      mutate(NR_FEDERACAO = para_texto(NR_FEDERACAO)) |>
+      rename(AGRUPAMENTO_ORIG = NM_FEDERACAO, AGRUPAMENTO_COD = NR_FEDERACAO, VOTOS = QT_VOTOS_NOMINAIS_VALIDOS),
+    
+    resultados_2026_filtrado |>
+      mutate(NR_FEDERACAO = para_texto(NR_FEDERACAO)) |>
+      rename(AGRUPAMENTO_ORIG = NM_FEDERACAO, AGRUPAMENTO_COD = NR_FEDERACAO, VOTOS = QT_VOTOS_NOMINAIS_VALIDOS)
+  ) |>
+    mutate(SQ_CANDIDATO = para_texto(SQ_CANDIDATO))
+  
+  # Verificando se aparecem os 513 deputados eleitos no pleito
+  
+  verificacao_eleitos <- base_unificada |>
+    group_by(ANO_ELEICAO) |>
+    summarise(
+      qtd_nomes_unicos = n_distinct(NM_CANDIDATO),
+      qtd_sq_candidato_unicos = n_distinct(SQ_CANDIDATO),
+      .groups = "drop"
+    )
+  
+  print(verificacao_eleitos)
+  
+  # Processo de verificação dos deputados com mais votos no estado
+  
+  deputados_consolidados <- base_unificada |>
+    
+    # 1. Soma os votos de todas as zonas/municípios para ter o total do candidato na UF
+    group_by(
+      ANO_ELEICAO, SG_UF, SQ_CANDIDATO, NM_CANDIDATO,
+      SG_PARTIDO, AGRUPAMENTO_ORIG, AGRUPAMENTO_COD, DS_SIT_TOT_TURNO
+    ) |>
+    summarise(
+      TOTAL_VOTOS = sum(VOTOS, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    
+    # 2. Cria a chave de agrupamento: se for Partido Isolado (ou sem federação), usa o SG_PARTIDO;
+    #    se fizer parte de Coligação ou Federação, usa o nome da Coligação/Federação
+    define_agrupamento() |>
+    
+    # 3. Ordena por Ano -> Estado -> Coligação/Partido -> Quantidade de Votos (do maior para o menor)
+    arrange(
+      ANO_ELEICAO,
+      SG_UF,
+      AGRUPAMENTO_ELEITORAL,
+      desc(TOTAL_VOTOS)
+    )
+}
+
+# Voto na legenda
+{
+  # Puxando os dados das planilhas do TSE votacao_partido_munzona_ANO_BRASIL para voto em legenda
+  # disponíveis no endpoint https://dadosabertos.tse.jus.br/dataset/resultados-ANO
+  
+  resultados_2014_partido <- fread(file = "C:/Users/controladoria/Downloads/votacao_partido_munzona_2014_BRASIL.csv",
+                                   sep = ";",
+                                   dec = ",",
+                                   encoding = "Latin-1")
+  resultados_2018_partido <- fread(file = "C:/Users/controladoria/Downloads/votacao_partido_munzona_2018_BRASIL.csv",
+                                   sep = ";",
+                                   dec = ",",
+                                   encoding = "Latin-1")
+  resultados_2022_partido <- fread(file = "C:/Users/controladoria/Downloads/votacao_partido_munzona_2022_BRASIL.csv",
+                                   sep = ";",
+                                   dec = ",",
+                                   encoding = "Latin-1")
+  resultados_2026_partido <- fread(file = "C:/Users/controladoria/Downloads/votacao_partido_munzona_2026_BRASIL.csv",
+                                   sep = ";",
+                                   dec = ",",
+                                   encoding = "Latin-1")
+  
+  # Unificando os votos conferidos em legenda
+  
+  legenda_unificada <- bind_rows(
+    resultados_2014_partido |> filter(CD_CARGO == 6) |> select(ANO_ELEICAO, SG_UF, SG_PARTIDO, VOTOS_LEG = QT_VOTOS_LEGENDA),
+    resultados_2018_partido |> filter(CD_CARGO == 6) |> select(ANO_ELEICAO, SG_UF, SG_PARTIDO, VOTOS_LEG = QT_TOTAL_VOTOS_LEG_VALIDOS),
+    resultados_2022_partido |> filter(CD_CARGO == 6) |> select(ANO_ELEICAO, SG_UF, SG_PARTIDO, VOTOS_LEG = QT_TOTAL_VOTOS_LEG_VALIDOS),
+    resultados_2026_partido |> filter(CD_CARGO == 6) |> select(ANO_ELEICAO, SG_UF, SG_PARTIDO, VOTOS_LEG = QT_TOTAL_VOTOS_LEG_VALIDOS)
+  ) |>
+    group_by(ANO_ELEICAO, SG_UF, SG_PARTIDO) |>
+    summarise(
+      QTD_VOTOS_LEGENDA_PARTIDO = sum(VOTOS_LEG, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Empilhando as bases BRUTAS filtrando apenas Deputado Federal (CD_CARGO == 6)
+  # Removemos apenas registros sem efeito no turno (#NULO# em DS_SIT_TOT_TURNO são candidatos indeferidos/renúncia)
+  # São considerados os listados como "NÃO ELEITO" para fins de cálculo do quociente
+  candidatos_todos <- bind_rows(
+    resultados_2014 |> 
+      filter(CD_CARGO == 6, !DS_SIT_TOT_TURNO %in% c("#NULO#", "")) |>
+      mutate(SQ_COLIGACAO = para_texto(SQ_COLIGACAO)) |>
+      select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, SG_UF, 
+             AGRUPAMENTO_ORIG = NM_COLIGACAO, AGRUPAMENTO_COD = SQ_COLIGACAO, DS_SIT_TOT_TURNO, VOTOS = QT_VOTOS_NOMINAIS),
+    
+    resultados_2018 |> 
+      filter(CD_CARGO == 6, !DS_SIT_TOT_TURNO %in% c("#NULO#", "")) |>
+      mutate(SQ_COLIGACAO = para_texto(SQ_COLIGACAO)) |>
+      select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, SG_UF, 
+             AGRUPAMENTO_ORIG = NM_COLIGACAO, AGRUPAMENTO_COD = SQ_COLIGACAO, DS_SIT_TOT_TURNO, VOTOS = QT_VOTOS_NOMINAIS_VALIDOS),
+    
+    resultados_2022 |> 
+      filter(CD_CARGO == 6, !DS_SIT_TOT_TURNO %in% c("#NULO#", "")) |>
+      mutate(NR_FEDERACAO = para_texto(NR_FEDERACAO)) |>
+      select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, SG_UF, 
+             AGRUPAMENTO_ORIG = NM_FEDERACAO, AGRUPAMENTO_COD = NR_FEDERACAO, DS_SIT_TOT_TURNO, VOTOS = QT_VOTOS_NOMINAIS_VALIDOS),
+    
+    resultados_2026 |> 
+      filter(CD_CARGO == 6, !DS_SIT_TOT_TURNO %in% c("#NULO#", "")) |>
+      mutate(NR_FEDERACAO = para_texto(NR_FEDERACAO)) |>
+      select(ANO_ELEICAO, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, SG_UF, 
+             AGRUPAMENTO_ORIG = NM_FEDERACAO, AGRUPAMENTO_COD = NR_FEDERACAO, DS_SIT_TOT_TURNO, VOTOS = QT_VOTOS_NOMINAIS_VALIDOS)
+  ) |>
+    mutate(SQ_CANDIDATO = para_texto(SQ_CANDIDATO)) |>
+    # Soma os votos nominais de cada candidato no estado (munzona -> UF)
+    group_by(ANO_ELEICAO, SG_UF, SQ_CANDIDATO, NM_CANDIDATO, SG_PARTIDO, AGRUPAMENTO_ORIG, AGRUPAMENTO_COD, DS_SIT_TOT_TURNO) |>
+    summarise(
+      VOTOS_NOMINAIS_CANDIDATO = sum(VOTOS, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    # Define o agrupamento eleitoral (Coligação/Federação ou Partido Isolado)
+    define_agrupamento()
+  
+  # Calculo do Quociente Eleitoral (QE) Exato por UF e o Total por Partido/Coligação
+  
+  # 4.1 Total de votos de legenda por UF
+  legenda_uf <- legenda_unificada |>
+    group_by(ANO_ELEICAO, SG_UF) |>
+    summarise(TOTAL_LEGENDA_UF = sum(QTD_VOTOS_LEGENDA_PARTIDO, na.rm = TRUE), .groups = "drop")
+  
+  # 4.2 Cálculo do Quociente Eleitoral Exato por Ano e UF
+  quociente_uf <- candidatos_todos |>
+    group_by(ANO_ELEICAO, SG_UF) |>
+    summarise(
+      TOTAL_NOMINAIS_UF = sum(VOTOS_NOMINAIS_CANDIDATO, na.rm = TRUE),
+      # Conta quantas cadeiras existem no estado (total de deputados eleitos na UF)
+      QTD_ELEITOS_OBSERVADOS = n_distinct(SQ_CANDIDATO[DS_SIT_TOT_TURNO %in% situacoes_eleito]),
+      .groups = "drop"
+    ) |>
+    left_join(cadeiras_uf, by = "SG_UF") |>
+    left_join(legenda_uf, by = c("ANO_ELEICAO", "SG_UF")) |>
+    mutate(
+      TOTAL_LEGENDA_UF = coalesce(TOTAL_LEGENDA_UF, 0),
+      VOTOS_VALIDOS_UF = TOTAL_NOMINAIS_UF + TOTAL_LEGENDA_UF,
+      QE_BRUTO = VOTOS_VALIDOS_UF / QTD_CADEIRAS_UF,
+      # Regra do Art. 106 do Código Eleitoral: fração <= 0.5 despreza; > 0.5 arredonda para cima
+      QUOCIENTE_ELEITORAL = if_else((QE_BRUTO %% 1) > 0.5, ceiling(QE_BRUTO), floor(QE_BRUTO))
+    )
+  
+  # 4.3 Votos totais do Partido e da Coligação/Federação (incluindo Não Eleitos e Legenda)
+  # Partidos com candidato válido: agrupamento vem do arquivo de candidato (já validado)
+  mapa_candidatos <- candidatos_todos |>
+    distinct(ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ID, AGRUPAMENTO_ELEITORAL)
+  
+  # Partidos sem candidato válido (só voto de legenda): agrupamento vem do arquivo de partido.
+  # Se o partido tiver mais de uma marcação nesse arquivo, prevalece a coligação/federação
+  # sobre "isolado" (linhas com #NULO#/PARTIDO ISOLADO costumam ser falta de preenchimento)
+  mapa_partido <- bind_rows(
+    resultados_2014_partido |> filter(CD_CARGO == 6) |>
+      distinct(ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ORIG = NM_COLIGACAO, AGRUPAMENTO_COD = para_texto(SQ_COLIGACAO)),
+    resultados_2018_partido |> filter(CD_CARGO == 6) |>
+      distinct(ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ORIG = NM_COLIGACAO, AGRUPAMENTO_COD = para_texto(SQ_COLIGACAO)),
+    resultados_2022_partido |> filter(CD_CARGO == 6) |>
+      distinct(ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ORIG = NM_FEDERACAO, AGRUPAMENTO_COD = para_texto(NR_FEDERACAO)),
+    resultados_2026_partido |> filter(CD_CARGO == 6) |>
+      distinct(ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ORIG = NM_FEDERACAO, AGRUPAMENTO_COD = para_texto(NR_FEDERACAO))
+  ) |>
+    define_agrupamento() |>
+    distinct(ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ID, AGRUPAMENTO_ELEITORAL) |>
+    anti_join(mapa_candidatos, by = c("ANO_ELEICAO", "SG_UF", "SG_PARTIDO")) |>
+    group_by(ANO_ELEICAO, SG_UF, SG_PARTIDO) |>
+    mutate(N_AGRUP_DISTINTOS = n_distinct(AGRUPAMENTO_ID[!startsWith(AGRUPAMENTO_ID, "PART_")])) |>
+    arrange(startsWith(AGRUPAMENTO_ID, "PART_"), .by_group = TRUE) |>
+    slice(1) |>
+    ungroup()
+  
+  # Conferindo se um mesmo partido é marcado em duas coligações/federações DIFERENTES na mesma UF
+  conflitos_agrupamento <- filter(mapa_partido, N_AGRUP_DISTINTOS > 1)
+  if (nrow(conflitos_agrupamento) > 0) {
+    print(conflitos_agrupamento)
+    stop("Partido em mais de uma coligação/federação na mesma UF: conferir manualmente")
+  }
+  
+  mapa_agrupamento <- bind_rows(
+    mapa_candidatos,
+    select(mapa_partido, ANO_ELEICAO, SG_UF, SG_PARTIDO, AGRUPAMENTO_ID, AGRUPAMENTO_ELEITORAL)
+  )
+  
+  # Cada partido precisa ter um único agrupamento por UF/ano
+  duplicados <- mapa_agrupamento |> group_by(ANO_ELEICAO, SG_UF, SG_PARTIDO) |> filter(n() > 1)
+  if (nrow(duplicados) > 0) {
+    print(duplicados)
+    stop("Partido com mais de um agrupamento na mesma UF")
+  }
+  
+  # Votos de cada partido e de cada lista (coligação/federação/partido isolado).
+  # Precisa vir DEPOIS do mapa_agrupamento, que define a lista de cada partido.
+  votos_agrupamento <- candidatos_todos |>
+    group_by(ANO_ELEICAO, SG_UF, SG_PARTIDO) |>
+    summarise(VOTOS_NOMINAIS_PARTIDO = sum(VOTOS_NOMINAIS_CANDIDATO, na.rm = TRUE), .groups = "drop") |>
+    full_join(legenda_unificada, by = c("ANO_ELEICAO", "SG_UF", "SG_PARTIDO")) |>
+    left_join(mapa_agrupamento, by = c("ANO_ELEICAO", "SG_UF", "SG_PARTIDO")) |>
+    mutate(
+      VOTOS_NOMINAIS_PARTIDO = coalesce(VOTOS_NOMINAIS_PARTIDO, 0),
+      QTD_VOTOS_LEGENDA = coalesce(QTD_VOTOS_LEGENDA_PARTIDO, 0),
+      VOTOS_TOTAIS_PARTIDO = VOTOS_NOMINAIS_PARTIDO + QTD_VOTOS_LEGENDA
+    ) |>
+    group_by(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID) |>
+    mutate(
+      QTD_VOTOS_LEGENDA_AGRUPAMENTO = sum(QTD_VOTOS_LEGENDA),
+      VOTOS_TOTAIS_AGRUPAMENTO = sum(VOTOS_TOTAIS_PARTIDO)
+    ) |>
+    ungroup()
+}
+
+# Planilha final com parlamentares eleitos, quocientes eleitorais por estado e quantidade de votos do partido
+{
+  planilha_deputados_final <- candidatos_todos |>
+    filter(DS_SIT_TOT_TURNO %in% situacoes_eleito) |>
+    left_join(
+      votos_agrupamento |> select(ANO_ELEICAO, SG_UF, SG_PARTIDO, QTD_VOTOS_LEGENDA, 
+                                  VOTOS_TOTAIS_PARTIDO, QTD_VOTOS_LEGENDA_AGRUPAMENTO, VOTOS_TOTAIS_AGRUPAMENTO),
+      by = c("ANO_ELEICAO", "SG_UF", "SG_PARTIDO")
+    ) |>
+    left_join(
+      quociente_uf |> select(ANO_ELEICAO, SG_UF, QTD_CADEIRAS_UF, VOTOS_VALIDOS_UF, QUOCIENTE_ELEITORAL),
+      by = c("ANO_ELEICAO", "SG_UF")
+    ) |>
+    left_join(regras_ano, by = "ANO_ELEICAO") |>
+    mutate(
+      # Verifica se o deputado sozinho bateu o Quociente Eleitoral (>= 1.0)
+      PROPORCAO_DO_QE = round(VOTOS_NOMINAIS_CANDIDATO / QUOCIENTE_ELEITORAL, 2),
+      BATEU_QE_SOZINHO = VOTOS_NOMINAIS_CANDIDATO >= QUOCIENTE_ELEITORAL,
+      # Quantos Quocientes Eleitorais a coligação/partido fez no total (Quociente Partidário)
+      QP_AGRUPAMENTO = floor(VOTOS_TOTAIS_AGRUPAMENTO / QUOCIENTE_ELEITORAL),
+      PUXADOR = BATEU_QE_SOZINHO,
+      # Votos excedentes ao QE (contínua; 0 para quem não é puxador)
+      EXCEDENTE_SOBRE_QE = pmax(VOTOS_NOMINAIS_CANDIDATO - QUOCIENTE_ELEITORAL, 0),
+      # Quantos QEs "inteiros" o excedente representa (aproximação grosseira, não é o contrafactual)
+      QES_NO_EXCEDENTE = floor(EXCEDENTE_SOBRE_QE / QUOCIENTE_ELEITORAL),
+      # Limiares da regra vigente no ano
+      ATINGE_LIMIAR_INDIV_QP = VOTOS_NOMINAIS_CANDIDATO >= LIMIAR_INDIV_QP * QUOCIENTE_ELEITORAL,
+      ATINGE_LIMIAR_INDIV_SOBRAS = VOTOS_NOMINAIS_CANDIDATO >= LIMIAR_INDIV_SOBRAS * QUOCIENTE_ELEITORAL,
+      AGRUPAMENTO_FEZ_QE = VOTOS_TOTAIS_AGRUPAMENTO >= QUOCIENTE_ELEITORAL,
+      AGRUPAMENTO_ATINGE_LIMIAR_SOBRAS = VOTOS_TOTAIS_AGRUPAMENTO >= LIMIAR_AGRUP_SOBRAS * QUOCIENTE_ELEITORAL
+    ) |>
+    # Variáveis por agrupamento (descritivas; não substituem a simulação contrafactual)
+    group_by(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID) |>
+    mutate(
+      ELEITOS_AGRUPAMENTO = n(),
+      N_PUXADORES_AGRUPAMENTO = sum(PUXADOR),
+      AGRUPAMENTO_TEM_PUXADOR = N_PUXADORES_AGRUPAMENTO > 0,
+      # Eleitos do agrupamento que NÃO fizeram o QE sozinhos
+      ELEITOS_SEM_QE_AGRUPAMENTO = sum(!PUXADOR),
+      # Cadeiras além do QP (vieram das sobras)
+      VAGAS_POR_SOBRAS_AGRUPAMENTO = ELEITOS_AGRUPAMENTO - QP_AGRUPAMENTO
+    ) |>
+    ungroup() |>
+    # Ordenação solicitada: Ano -> Estado -> Coligação/Partido -> Quantidade de votos do deputado
+    arrange(
+      ANO_ELEICAO,
+      SG_UF,
+      AGRUPAMENTO_ELEITORAL,
+      desc(VOTOS_NOMINAIS_CANDIDATO)
+    )
+}
+
+# =====================================================================================
+# PUXADORES, PUXADOS E ORDEM DOS ELEITOS
+#
+# Requer os objetos já criados no script: candidatos_todos, votos_agrupamento,
+# quociente_uf, planilha_deputados_final, situacoes_eleito.
+#
+# Partes:
+#   A. Corte por UF (critério do professor): último eleito x não eleitos mais votados
+#   B. Função que distribui as cadeiras com a regra de cada ano (QP + sobras)
+#   C. Simulação: (1) resultado real, validado contra o TSE; (2) contrafactual sem o
+#      excedente dos puxadores -> quem a lista perde são os puxados
+#   D. Tabela final: um eleito por linha, com forma de eleição e posição por votos
+# =====================================================================================
+
+# -------------------------------------------------------------------------------------
+# A. CORTE POR UF
+# -------------------------------------------------------------------------------------
+{
+  eleitos     <- candidatos_todos |> filter(DS_SIT_TOT_TURNO %in% situacoes_eleito)
+  nao_eleitos <- candidatos_todos |> filter(!DS_SIT_TOT_TURNO %in% situacoes_eleito)
+  
+  # I. Eleito menos votado da UF
+  ultimo_eleito_uf <- eleitos |>
+    group_by(ANO_ELEICAO, SG_UF) |>
+    slice_min(VOTOS_NOMINAIS_CANDIDATO, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    select(ANO_ELEICAO, SG_UF, ULTIMO_ELEITO = NM_CANDIDATO,
+           PARTIDO_ULTIMO_ELEITO = SG_PARTIDO, VOTOS_ULTIMO_ELEITO = VOTOS_NOMINAIS_CANDIDATO)
+  
+  # II. Não eleitos com mais votos que o último eleito
+  corte_uf <- ultimo_eleito_uf |>
+    left_join(
+      nao_eleitos |>
+        inner_join(select(ultimo_eleito_uf, ANO_ELEICAO, SG_UF, VOTOS_ULTIMO_ELEITO),
+                   by = c("ANO_ELEICAO", "SG_UF")) |>
+        filter(VOTOS_NOMINAIS_CANDIDATO > VOTOS_ULTIMO_ELEITO) |>
+        group_by(ANO_ELEICAO, SG_UF) |>
+        arrange(desc(VOTOS_NOMINAIS_CANDIDATO), .by_group = TRUE) |>
+        summarise(N_NAO_ELEITOS_ACIMA_DO_CORTE = n(),
+                  MAIS_VOTADO_NAO_ELEITO = first(NM_CANDIDATO),
+                  PARTIDO_MAIS_VOTADO_NAO_ELEITO = first(SG_PARTIDO),
+                  VOTOS_MAIS_VOTADO_NAO_ELEITO = first(VOTOS_NOMINAIS_CANDIDATO),
+                  .groups = "drop"),
+      by = c("ANO_ELEICAO", "SG_UF")
+    ) |>
+    mutate(N_NAO_ELEITOS_ACIMA_DO_CORTE = coalesce(N_NAO_ELEITOS_ACIMA_DO_CORTE, 0L))
+}
+
+# -------------------------------------------------------------------------------------
+# B. FUNÇÃO DE DISTRIBUIÇÃO DE CADEIRAS
+#   votos    : vetor nomeado com os votos válidos de cada lista (nomes = AGRUPAMENTO_ID)
+#   cands    : lista nomeada; cada elemento é o vetor de votos dos candidatos da lista,
+#              em ordem decrescente, com nomes = SQ_CANDIDATO
+#   qe       : quociente eleitoral; cadeiras: vagas da UF; ano: 2014, 2018, 2022 ou 2026
+#   Retorna um data.frame com um eleito por linha: lista, candidato, etapa, rodada e média
+# -------------------------------------------------------------------------------------
+aloca_cadeiras <- function(votos, cands, qe, cadeiras, ano) {
+  
+  eleitos_lista <- setNames(vector("list", length(votos)), names(votos))
+  registro <- list()
+  
+  # 1) QUOCIENTE PARTIDÁRIO: floor(votos / QE) vagas por lista, para os mais votados.
+  #    A partir de 2018, só ocupa vaga de QP quem tem >= 10% do QE (art. 108 do CE);
+  #    vagas de QP sem candidato apto vão para as sobras.
+  lim_qp <- if (ano == 2014) 0 else 0.10
+  for (k in names(votos)) {
+    c_k   <- cands[[k]]
+    aptos <- names(c_k)[c_k >= lim_qp * qe]
+    n     <- min(floor(votos[[k]] / qe), length(aptos))
+    if (n > 0) {
+      eleitos_lista[[k]] <- aptos[seq_len(n)]
+      registro[[length(registro) + 1]] <- data.frame(
+        AGRUPAMENTO_ID = k, SQ_CANDIDATO = aptos[seq_len(n)],
+        ETAPA = "QP", RODADA_SOBRA = NA_integer_, MEDIA_SOBRA = NA_real_)
+    }
+  }
+  restantes <- cadeiras - sum(lengths(eleitos_lista))
+  
+  # 2) SOBRAS: a cada rodada, a vaga vai para a lista com maior média
+  #    votos / (vagas já obtidas + 1), entre as listas aptas naquela fase.
+  #    lista_ok  = condição sobre a lista; cand_min = fração do QE exigida do próximo candidato
+  fases <- switch(as.character(ano),
+                  "2014" = list(  # só listas que atingiram o QE (art. 109, §2º, redação anterior a 2017)
+                    list(nome = "Sobras", lista_ok = function(k) votos[[k]] >= qe, cand_min = 0)),
+                  "2018" = list(  # todas as listas; candidato com 10% do QE; depois, sem exigência
+                    list(nome = "Sobras (10% QE)", lista_ok = function(k) TRUE, cand_min = 0.10),
+                    list(nome = "Sobras (fase final)", lista_ok = function(k) TRUE, cand_min = 0)),
+                  # 2022 e 2026: lista com 80% do QE e candidato com 20%; depois, todas (STF, ADIs 7228/7263)
+                  list(
+                    list(nome = "Sobras (80/20)", lista_ok = function(k) votos[[k]] >= 0.8 * qe, cand_min = 0.20),
+                    list(nome = "Sobras (fase final)", lista_ok = function(k) TRUE, cand_min = 0))
+  )
+  
+  rodada <- 0L
+  for (f in fases) {
+    while (restantes > 0) {
+      medias <- vapply(names(votos), function(k) {
+        n_el <- length(eleitos_lista[[k]])
+        c_k  <- cands[[k]]
+        if (n_el >= length(c_k)) return(NA_real_)                  # lista sem candidatos restantes
+        if (!f$lista_ok(k) || c_k[n_el + 1] < f$cand_min * qe) return(NA_real_)  # não apta nesta fase
+        votos[[k]] / (n_el + 1)
+      }, numeric(1))
+      if (all(is.na(medias))) break                                # ninguém apto: passa à próxima fase
+      k   <- names(medias)[which.max(medias)]
+      sq  <- names(cands[[k]])[length(eleitos_lista[[k]]) + 1]     # próximo mais votado da lista
+      eleitos_lista[[k]] <- c(eleitos_lista[[k]], sq)
+      rodada    <- rodada + 1L
+      restantes <- restantes - 1L
+      registro[[length(registro) + 1]] <- data.frame(
+        AGRUPAMENTO_ID = k, SQ_CANDIDATO = sq,
+        ETAPA = f$nome, RODADA_SOBRA = rodada, MEDIA_SOBRA = max(medias, na.rm = TRUE))
+    }
+  }
+  do.call(rbind, registro)
+}
+
+# -------------------------------------------------------------------------------------
+# C. SIMULAÇÃO POR UF E ANO
+# -------------------------------------------------------------------------------------
+{
+  listas_sim <- votos_agrupamento |>
+    distinct(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID, VOTOS_TOTAIS_AGRUPAMENTO)
+  
+  uf_anos <- quociente_uf |>
+    filter(!is.na(QTD_CADEIRAS_UF)) |>
+    select(ANO_ELEICAO, SG_UF, QUOCIENTE_ELEITORAL, QTD_CADEIRAS_UF)
+  
+  # Checagem: toda lista de candidatos precisa ter seus votos em votos_agrupamento,
+  # com o MESMO AGRUPAMENTO_ID (e sem listas duplicadas ou sem código)
+  listas_sem_votos <- candidatos_todos |>
+    distinct(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID) |>
+    anti_join(listas_sim, by = c("ANO_ELEICAO", "SG_UF", "AGRUPAMENTO_ID"))
+  listas_duplicadas <- listas_sim |>
+    count(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID) |>
+    filter(n > 1 | is.na(AGRUPAMENTO_ID))
+  if (nrow(listas_sem_votos) > 0 || nrow(listas_duplicadas) > 0) {
+    print(listas_sem_votos)
+    print(listas_duplicadas)
+    stop("AGRUPAMENTO_ID de candidatos_todos e votos_agrupamento não batem: ",
+         "reinicie o R e rode o script do início")
+  }
+  
+  sim_eleitos <- list(); sim_puxados <- list(); sim_validacao <- list(); sim_listas <- list()
+  
+  for (i in seq_len(nrow(uf_anos))) {
+    ano <- uf_anos$ANO_ELEICAO[i]; uf <- uf_anos$SG_UF[i]
+    qe  <- uf_anos$QUOCIENTE_ELEITORAL[i]; cad <- uf_anos$QTD_CADEIRAS_UF[i]
+    
+    L <- listas_sim |> filter(ANO_ELEICAO == ano, SG_UF == uf)
+    C <- candidatos_todos |> filter(ANO_ELEICAO == ano, SG_UF == uf) |>
+      arrange(desc(VOTOS_NOMINAIS_CANDIDATO))
+    
+    votos <- setNames(as.numeric(L$VOTOS_TOTAIS_AGRUPAMENTO), L$AGRUPAMENTO_ID)
+    cands <- lapply(split(C, C$AGRUPAMENTO_ID),
+                    function(d) setNames(as.numeric(d$VOTOS_NOMINAIS_CANDIDATO), d$SQ_CANDIDATO))
+    
+    # (1) Resultado real simulado e validação contra os eleitos do TSE
+    base <- aloca_cadeiras(votos, cands, qe, cad, ano)
+    oficiais <- C$SQ_CANDIDATO[C$DS_SIT_TOT_TURNO %in% situacoes_eleito]
+    sim_validacao[[i]] <- data.frame(ANO_ELEICAO = ano, SG_UF = uf,
+                                     REPRODUZ_OFICIAL = setequal(base$SQ_CANDIDATO, oficiais))
+    sim_eleitos[[i]] <- cbind(ANO_ELEICAO = ano, SG_UF = uf, base)
+    
+    # (2) Contrafactual: para cada lista com puxador, retira o excedente (votos - QE) de
+    #     TODOS os seus puxadores (cada um fica com exatamente 1 QE) e distribui de novo.
+    #     Eleitos da lista que perdem a vaga = puxados. Listas com vários puxadores são
+    #     tratadas em conjunto, para não contar o mesmo puxado duas vezes.
+    P <- C |> filter(VOTOS_NOMINAIS_CANDIDATO >= qe)
+    for (k in unique(P$AGRUPAMENTO_ID)) {
+      Pk <- P |> filter(AGRUPAMENTO_ID == k)
+      votos_cf <- votos
+      votos_cf[[k]] <- votos_cf[[k]] - sum(Pk$VOTOS_NOMINAIS_CANDIDATO - qe)
+      cf <- aloca_cadeiras(votos_cf, cands, qe, cad, ano)
+      perdidos <- setdiff(base$SQ_CANDIDATO[base$AGRUPAMENTO_ID == k],
+                          cf$SQ_CANDIDATO[cf$AGRUPAMENTO_ID == k])
+      puxadores_txt <- paste0(Pk$NM_CANDIDATO, " (", Pk$SG_PARTIDO, ")", collapse = "; ")
+      
+      sim_listas[[length(sim_listas) + 1]] <- data.frame(
+        ANO_ELEICAO = ano, SG_UF = uf, AGRUPAMENTO_ID = k, PUXADORES = puxadores_txt,
+        CADEIRAS_LISTA = sum(base$AGRUPAMENTO_ID == k),
+        CADEIRAS_SEM_EXCEDENTE = sum(cf$AGRUPAMENTO_ID == k),
+        N_PUXADOS = length(perdidos))
+      if (length(perdidos) > 0)
+        sim_puxados[[length(sim_puxados) + 1]] <- data.frame(
+          ANO_ELEICAO = ano, SG_UF = uf, SQ_CANDIDATO = perdidos, PUXADO_POR = puxadores_txt)
+    }
+  }
+  
+  sim_eleitos    <- bind_rows(sim_eleitos)
+  sim_puxados    <- bind_rows(sim_puxados)
+  sim_validacao  <- bind_rows(sim_validacao)
+  puxadores_por_lista <- bind_rows(sim_listas)
+  
+  # A simulação precisa reproduzir os eleitos do TSE em todas as UFs (deve sair vazio)
+  print(filter(sim_validacao, !REPRODUZ_OFICIAL))
+}
+
+# -------------------------------------------------------------------------------------
+# D. TABELA FINAL: UM ELEITO POR LINHA
+# -------------------------------------------------------------------------------------
+{
+  classificacao_eleitos <- eleitos |>
+    left_join(select(quociente_uf, ANO_ELEICAO, SG_UF, QUOCIENTE_ELEITORAL),
+              by = c("ANO_ELEICAO", "SG_UF")) |>
+    left_join(select(corte_uf, ANO_ELEICAO, SG_UF, VOTOS_MAIS_VOTADO_NAO_ELEITO),
+              by = c("ANO_ELEICAO", "SG_UF")) |>
+    left_join(select(sim_eleitos, ANO_ELEICAO, SG_UF, SQ_CANDIDATO, ETAPA, RODADA_SOBRA, MEDIA_SOBRA),
+              by = c("ANO_ELEICAO", "SG_UF", "SQ_CANDIDATO")) |>
+    left_join(sim_puxados, by = c("ANO_ELEICAO", "SG_UF", "SQ_CANDIDATO")) |>
+    group_by(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID) |>
+    mutate(LISTA_TEM_PUXADOR = any(VOTOS_NOMINAIS_CANDIDATO >= QUOCIENTE_ELEITORAL)) |>
+    ungroup() |>
+    mutate(
+      # Forma de eleição pela SIMULAÇÃO (critério principal)
+      FORMA_ELEICAO = case_when(
+        VOTOS_NOMINAIS_CANDIDATO >= QUOCIENTE_ELEITORAL ~ "Puxador",
+        !is.na(PUXADO_POR)                              ~ "Puxado",
+        TRUE                                            ~ "Eleito normalmente"),
+      # Critério do corte (professor): abaixo do não eleito mais votado, em lista com puxador
+      ELEITO_ABAIXO_DE_NAO_ELEITO = VOTOS_NOMINAIS_CANDIDATO < coalesce(VOTOS_MAIS_VOTADO_NAO_ELEITO, 0),
+      FORMA_ELEICAO_CRITERIO_CORTE = case_when(
+        VOTOS_NOMINAIS_CANDIDATO >= QUOCIENTE_ELEITORAL      ~ "Puxador",
+        ELEITO_ABAIXO_DE_NAO_ELEITO & LISTA_TEM_PUXADOR      ~ "Puxado", # Para ser considerado puxado, a lista deve ter um puxador
+        TRUE                                                 ~ "Eleito normalmente"),
+      ETAPA_ELEICAO = if_else(ETAPA == "QP", "QP",
+                              paste0(ETAPA, " - rodada ", RODADA_SOBRA))
+    ) |>
+    # ORDEM DOS ELEITOS PELA QUANTIDADE DE VOTOS
+    # POSICAO_VOTOS_UF:    1º = eleito mais votado da UF ... nº = eleito menos votado da UF
+    # POSICAO_VOTOS_LISTA: mesma ordem, dentro da própria lista (partido/coligação/federação)
+    group_by(ANO_ELEICAO, SG_UF) |>
+    mutate(POSICAO_VOTOS_UF = row_number(desc(VOTOS_NOMINAIS_CANDIDATO)),
+           TOTAL_ELEITOS_UF = n()) |>
+    group_by(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID) |>
+    mutate(POSICAO_VOTOS_LISTA = row_number(desc(VOTOS_NOMINAIS_CANDIDATO))) |>
+    ungroup() |>
+    arrange(ANO_ELEICAO, SG_UF, POSICAO_VOTOS_UF) |>
+    select(ANO_ELEICAO, SQ_CANDIDATO,
+           NOME_COMPLETO = NM_CANDIDATO, PARTIDO = SG_PARTIDO, UF = SG_UF,
+           FORMA_ELEICAO, PUXADO_POR,
+           POSICAO_VOTOS_UF, TOTAL_ELEITOS_UF, POSICAO_VOTOS_LISTA,
+           VOTOS_NOMINAIS_CANDIDATO, ETAPA_ELEICAO, MEDIA_SOBRA,
+           FORMA_ELEICAO_CRITERIO_CORTE, ELEITO_ABAIXO_DE_NAO_ELEITO)
+  
+  # Junta à planilha final e reordena do 1º ao último eleito de cada UF
+  planilha_deputados_final <- planilha_deputados_final |>
+    left_join(
+      select(classificacao_eleitos, ANO_ELEICAO, SG_UF = UF, SQ_CANDIDATO,
+             FORMA_ELEICAO, PUXADO_POR, POSICAO_VOTOS_UF, POSICAO_VOTOS_LISTA,
+             ETAPA_ELEICAO, MEDIA_SOBRA, FORMA_ELEICAO_CRITERIO_CORTE, ELEITO_ABAIXO_DE_NAO_ELEITO),
+      by = c("ANO_ELEICAO", "SG_UF", "SQ_CANDIDATO")
+    ) |>
+    arrange(ANO_ELEICAO, SG_UF, POSICAO_VOTOS_UF)
+  stopifnot(!anyNA(planilha_deputados_final$FORMA_ELEICAO))
+  
+  # Resumo por ano: as duas medidas lado a lado
+  resumo_puxadores <- classificacao_eleitos |>
+    group_by(ANO_ELEICAO) |>
+    summarise(
+      PUXADORES = sum(FORMA_ELEICAO == "Puxador"),
+      LISTAS_COM_PUXADO = n_distinct(PUXADO_POR, na.rm = TRUE),
+      PUXADOS_SIMULACAO = sum(FORMA_ELEICAO == "Puxado"),
+      PUXADOS_CRITERIO_CORTE = sum(FORMA_ELEICAO_CRITERIO_CORTE == "Puxado"),
+      ELEITOS_ABAIXO_DO_CORTE = sum(ELEITO_ABAIXO_DE_NAO_ELEITO),
+      .groups = "drop")
+  print(resumo_puxadores)
+}
+
+# Exportação
+write_xlsx(list(classificacao_eleitos = classificacao_eleitos,
+                puxadores_por_lista   = puxadores_por_lista,
+                corte_uf              = corte_uf,
+                resumo                = resumo_puxadores,
+                validacao_simulacao   = sim_validacao),
+           file.path("C:/Users/Desktop 3/Documents", "puxadores_classificacao.xlsx"))
+
+# =====================================================================================
+# CHECAGENS DE INTEGRIDADE
+# Todas as tabelas abaixo deveriam sair vazias (0 linhas). Linhas = algo a investigar.
+# =====================================================================================
+{
+  # Checagem 1: eleitos por UF batem com a tabela fixa de cadeiras?
+  # (parte da tabela de cadeiras, para acusar também UF ausente da base, como RO 2026)
+  checagem_cadeiras <- expand_grid(ANO_ELEICAO = c(2014L, 2018L, 2022L, 2026L), cadeiras_uf) |>
+    left_join(select(quociente_uf, ANO_ELEICAO, SG_UF, QTD_ELEITOS_OBSERVADOS),
+              by = c("ANO_ELEICAO", "SG_UF")) |>
+    filter(is.na(QTD_ELEITOS_OBSERVADOS) | QTD_ELEITOS_OBSERVADOS != QTD_CADEIRAS_UF)
+  print(checagem_cadeiras)
+  
+  # Checagem 2: situações não previstas (ex.: problema de encoding em "ELEITO POR MÉDIA")
+  situacoes_conhecidas <- c(situacoes_eleito, "SUPLENTE", "NÃO ELEITO", "#NULO#", "")
+  checagem_situacoes <- bind_rows(
+    resultados_2014 |> filter(CD_CARGO == 6) |> distinct(ANO_ELEICAO, DS_SIT_TOT_TURNO),
+    resultados_2018 |> filter(CD_CARGO == 6) |> distinct(ANO_ELEICAO, DS_SIT_TOT_TURNO),
+    resultados_2022 |> filter(CD_CARGO == 6) |> distinct(ANO_ELEICAO, DS_SIT_TOT_TURNO),
+    resultados_2026 |> filter(CD_CARGO == 6) |> distinct(ANO_ELEICAO, DS_SIT_TOT_TURNO)
+  ) |>
+    filter(!DS_SIT_TOT_TURNO %in% situacoes_conhecidas)
+  print(checagem_situacoes)
+  
+  # Checagem 3: nominais do arquivo de candidato x nominais do arquivo de partido, por partido/UF.
+  # Em 2014 (sem coluna de válidos), diferenças apontam onde há votos anulados ou de
+  # candidatos #NULO# — é a lista de partidos/UFs para a conferência manual.
+  # A coluna de nominais do arquivo de partido é escolhida conforme o que existir no arquivo.
+  nominais_partido_arquivo <- function(df) {
+    col <- intersect(c("QT_VOTOS_NOMINAIS_VALIDOS", "QT_VOTOS_NOMINAIS"), names(df))[1]
+    df |>
+      filter(CD_CARGO == 6) |>
+      group_by(ANO_ELEICAO, SG_UF, SG_PARTIDO) |>
+      summarise(NOMINAIS_ARQ_PARTIDO = sum(.data[[col]], na.rm = TRUE), .groups = "drop")
+  }
+  checagem_nominais <- bind_rows(
+    nominais_partido_arquivo(resultados_2014_partido),
+    nominais_partido_arquivo(resultados_2018_partido),
+    nominais_partido_arquivo(resultados_2022_partido),
+    nominais_partido_arquivo(resultados_2026_partido)
+  ) |>
+    full_join(
+      candidatos_todos |>
+        group_by(ANO_ELEICAO, SG_UF, SG_PARTIDO) |>
+        summarise(NOMINAIS_ARQ_CANDIDATO = sum(VOTOS_NOMINAIS_CANDIDATO), .groups = "drop"),
+      by = c("ANO_ELEICAO", "SG_UF", "SG_PARTIDO")
+    ) |>
+    mutate(DIFERENCA = coalesce(NOMINAIS_ARQ_CANDIDATO, 0) - coalesce(NOMINAIS_ARQ_PARTIDO, 0)) |>
+    filter(DIFERENCA != 0) |>
+    arrange(ANO_ELEICAO, desc(abs(DIFERENCA)))
+  print(checagem_nominais)
+  
+  # Checagem 4: cada AGRUPAMENTO_ID corresponde a um único nome (e vice-versa) dentro da UF?
+  checagem_agrupamento <- candidatos_todos |>
+    distinct(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID, AGRUPAMENTO_ELEITORAL) |>
+    group_by(ANO_ELEICAO, SG_UF) |>
+    filter(duplicated(AGRUPAMENTO_ID) | duplicated(AGRUPAMENTO_ELEITORAL)) |>
+    ungroup()
+  print(checagem_agrupamento)
+  
+  # Checagem 5: retotalização de 2022 (STF, ADIs 7228/7263). Em julho de 2025 a Câmara trocou
+  # 7 deputados (AP, DF, RO, TO). Se o arquivo do TSE for anterior à retotalização,
+  # os eleitos dessas UFs refletem o resultado original. Confira DT_GERACAO e a lista:
+  #   saíram: Silvia Waiãpi, Sonize Barbosa, Professora Goreth, Augusto Puppio (AP),
+  #           Gilvan Máximo (DF), Lebrão (RO), Lázaro Botelho (TO)
+  #   entraram: Paulo Lemos, André Abdon, Aline Gurgel, Professora Marcivania (AP),
+  #             Rodrigo Rollemberg (DF), Rafael Fera (RO), Tiago Dimas (TO)
+  # Nomes de urna; NM_CANDIDATO traz o nome civil, então confira pelo SQ_CANDIDATO se preciso.
+  if ("DT_GERACAO" %in% names(resultados_2022)) print(unique(resultados_2022$DT_GERACAO))
+  planilha_deputados_final |>
+    filter(ANO_ELEICAO == 2022, SG_UF %in% c("AP", "DF", "RO", "TO")) |>
+    select(SG_UF, NM_CANDIDATO, SG_PARTIDO, DS_SIT_TOT_TURNO, VOTOS_NOMINAIS_CANDIDATO) |>
+    print(n = Inf)
+  
+  # Checagem 6: joins sem correspondência (QE ou votos do agrupamento ausentes)
+  checagem_na <- planilha_deputados_final |>
+    filter(is.na(QUOCIENTE_ELEITORAL) | is.na(VOTOS_TOTAIS_AGRUPAMENTO))
+  print(checagem_na)
+}
+
+# Exportação do resultado
+write_xlsx(planilha_deputados_final, file.path("C:/Users/Desktop 3/Documents", "planilha_deputados_final.xlsx"))
