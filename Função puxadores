@@ -1,0 +1,268 @@
+# =====================================================================================
+# PUXADORES, PUXADOS E ORDEM DOS ELEITOS
+#
+# Requer os objetos já criados no script: candidatos_todos, votos_agrupamento,
+# quociente_uf, planilha_deputados_final, situacoes_eleito.
+#
+# Partes:
+#   A. Corte por UF (critério do professor): último eleito x não eleitos mais votados
+#   B. Função que distribui as cadeiras com a regra de cada ano (QP + sobras)
+#   C. Simulação: (1) resultado real, validado contra o TSE; (2) contrafactual sem o
+#      excedente dos puxadores -> quem a lista perde são os puxados
+#   D. Tabela final: um eleito por linha, com forma de eleição e posição por votos
+# =====================================================================================
+
+# -------------------------------------------------------------------------------------
+# A. CORTE POR UF
+# -------------------------------------------------------------------------------------
+{
+  eleitos     <- candidatos_todos |> filter(DS_SIT_TOT_TURNO %in% situacoes_eleito)
+  nao_eleitos <- candidatos_todos |> filter(!DS_SIT_TOT_TURNO %in% situacoes_eleito)
+  
+  # I. Eleito menos votado da UF
+  ultimo_eleito_uf <- eleitos |>
+    group_by(ANO_ELEICAO, SG_UF) |>
+    slice_min(VOTOS_NOMINAIS_CANDIDATO, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    select(ANO_ELEICAO, SG_UF, ULTIMO_ELEITO = NM_CANDIDATO,
+           PARTIDO_ULTIMO_ELEITO = SG_PARTIDO, VOTOS_ULTIMO_ELEITO = VOTOS_NOMINAIS_CANDIDATO)
+  
+  # II. Não eleitos com mais votos que o último eleito
+  corte_uf <- ultimo_eleito_uf |>
+    left_join(
+      nao_eleitos |>
+        inner_join(select(ultimo_eleito_uf, ANO_ELEICAO, SG_UF, VOTOS_ULTIMO_ELEITO),
+                   by = c("ANO_ELEICAO", "SG_UF")) |>
+        filter(VOTOS_NOMINAIS_CANDIDATO > VOTOS_ULTIMO_ELEITO) |>
+        group_by(ANO_ELEICAO, SG_UF) |>
+        arrange(desc(VOTOS_NOMINAIS_CANDIDATO), .by_group = TRUE) |>
+        summarise(N_NAO_ELEITOS_ACIMA_DO_CORTE = n(),
+                  MAIS_VOTADO_NAO_ELEITO = first(NM_CANDIDATO),
+                  PARTIDO_MAIS_VOTADO_NAO_ELEITO = first(SG_PARTIDO),
+                  VOTOS_MAIS_VOTADO_NAO_ELEITO = first(VOTOS_NOMINAIS_CANDIDATO),
+                  .groups = "drop"),
+      by = c("ANO_ELEICAO", "SG_UF")
+    ) |>
+    mutate(N_NAO_ELEITOS_ACIMA_DO_CORTE = coalesce(N_NAO_ELEITOS_ACIMA_DO_CORTE, 0L))
+}
+
+# -------------------------------------------------------------------------------------
+# B. FUNÇÃO DE DISTRIBUIÇÃO DE CADEIRAS
+#   votos    : vetor nomeado com os votos válidos de cada lista (nomes = AGRUPAMENTO_ID)
+#   cands    : lista nomeada; cada elemento é o vetor de votos dos candidatos da lista,
+#              em ordem decrescente, com nomes = SQ_CANDIDATO
+#   qe       : quociente eleitoral; cadeiras: vagas da UF; ano: 2014, 2018, 2022 ou 2026
+#   Retorna um data.frame com um eleito por linha: lista, candidato, etapa, rodada e média
+# -------------------------------------------------------------------------------------
+aloca_cadeiras <- function(votos, cands, qe, cadeiras, ano) {
+  
+  eleitos_lista <- setNames(vector("list", length(votos)), names(votos))
+  registro <- list()
+  
+  # 1) QUOCIENTE PARTIDÁRIO: floor(votos / QE) vagas por lista, para os mais votados.
+  #    A partir de 2018, só ocupa vaga de QP quem tem >= 10% do QE (art. 108 do CE);
+  #    vagas de QP sem candidato apto vão para as sobras.
+  lim_qp <- if (ano == 2014) 0 else 0.10
+  for (k in names(votos)) {
+    c_k   <- cands[[k]]
+    aptos <- names(c_k)[c_k >= lim_qp * qe]
+    n     <- min(floor(votos[[k]] / qe), length(aptos))
+    if (n > 0) {
+      eleitos_lista[[k]] <- aptos[seq_len(n)]
+      registro[[length(registro) + 1]] <- data.frame(
+        AGRUPAMENTO_ID = k, SQ_CANDIDATO = aptos[seq_len(n)],
+        ETAPA = "QP", RODADA_SOBRA = NA_integer_, MEDIA_SOBRA = NA_real_)
+    }
+  }
+  restantes <- cadeiras - sum(lengths(eleitos_lista))
+  
+  # 2) SOBRAS: a cada rodada, a vaga vai para a lista com maior média
+  #    votos / (vagas já obtidas + 1), entre as listas aptas naquela fase.
+  #    lista_ok  = condição sobre a lista; cand_min = fração do QE exigida do próximo candidato
+  fases <- switch(as.character(ano),
+                  "2014" = list(  # só listas que atingiram o QE (art. 109, §2º, redação anterior a 2017)
+                    list(nome = "Sobras", lista_ok = function(k) votos[[k]] >= qe, cand_min = 0)),
+                  "2018" = list(  # todas as listas; candidato com 10% do QE; depois, sem exigência
+                    list(nome = "Sobras (10% QE)", lista_ok = function(k) TRUE, cand_min = 0.10),
+                    list(nome = "Sobras (fase final)", lista_ok = function(k) TRUE, cand_min = 0)),
+                  # 2022 e 2026: lista com 80% do QE e candidato com 20%; depois, todas (STF, ADIs 7228/7263)
+                  list(
+                    list(nome = "Sobras (80/20)", lista_ok = function(k) votos[[k]] >= 0.8 * qe, cand_min = 0.20),
+                    list(nome = "Sobras (fase final)", lista_ok = function(k) TRUE, cand_min = 0))
+  )
+  
+  rodada <- 0L
+  for (f in fases) {
+    while (restantes > 0) {
+      medias <- vapply(names(votos), function(k) {
+        n_el <- length(eleitos_lista[[k]])
+        c_k  <- cands[[k]]
+        if (n_el >= length(c_k)) return(NA_real_)                  # lista sem candidatos restantes
+        if (!f$lista_ok(k) || c_k[n_el + 1] < f$cand_min * qe) return(NA_real_)  # não apta nesta fase
+        votos[[k]] / (n_el + 1)
+      }, numeric(1))
+      if (all(is.na(medias))) break                                # ninguém apto: passa à próxima fase
+      k   <- names(medias)[which.max(medias)]
+      sq  <- names(cands[[k]])[length(eleitos_lista[[k]]) + 1]     # próximo mais votado da lista
+      eleitos_lista[[k]] <- c(eleitos_lista[[k]], sq)
+      rodada    <- rodada + 1L
+      restantes <- restantes - 1L
+      registro[[length(registro) + 1]] <- data.frame(
+        AGRUPAMENTO_ID = k, SQ_CANDIDATO = sq,
+        ETAPA = f$nome, RODADA_SOBRA = rodada, MEDIA_SOBRA = max(medias, na.rm = TRUE))
+    }
+  }
+  do.call(rbind, registro)
+}
+
+# -------------------------------------------------------------------------------------
+# C. SIMULAÇÃO POR UF E ANO
+# -------------------------------------------------------------------------------------
+{
+  listas_sim <- votos_agrupamento |>
+    distinct(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID, VOTOS_TOTAIS_AGRUPAMENTO)
+  
+  uf_anos <- quociente_uf |>
+    filter(!is.na(QTD_CADEIRAS_UF)) |>
+    select(ANO_ELEICAO, SG_UF, QUOCIENTE_ELEITORAL, QTD_CADEIRAS_UF)
+  
+  # Checagem: toda lista de candidatos precisa ter seus votos em votos_agrupamento,
+  # com o MESMO AGRUPAMENTO_ID (e sem listas duplicadas ou sem código)
+  listas_sem_votos <- candidatos_todos |>
+    distinct(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID) |>
+    anti_join(listas_sim, by = c("ANO_ELEICAO", "SG_UF", "AGRUPAMENTO_ID"))
+  listas_duplicadas <- listas_sim |>
+    count(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID) |>
+    filter(n > 1 | is.na(AGRUPAMENTO_ID))
+  if (nrow(listas_sem_votos) > 0 || nrow(listas_duplicadas) > 0) {
+    print(listas_sem_votos)
+    print(listas_duplicadas)
+    stop("AGRUPAMENTO_ID de candidatos_todos e votos_agrupamento não batem: ",
+         "reinicie o R e rode o script do início")
+  }
+  
+  sim_eleitos <- list(); sim_puxados <- list(); sim_validacao <- list(); sim_listas <- list()
+  
+  for (i in seq_len(nrow(uf_anos))) {
+    ano <- uf_anos$ANO_ELEICAO[i]; uf <- uf_anos$SG_UF[i]
+    qe  <- uf_anos$QUOCIENTE_ELEITORAL[i]; cad <- uf_anos$QTD_CADEIRAS_UF[i]
+    
+    L <- listas_sim |> filter(ANO_ELEICAO == ano, SG_UF == uf)
+    C <- candidatos_todos |> filter(ANO_ELEICAO == ano, SG_UF == uf) |>
+      arrange(desc(VOTOS_NOMINAIS_CANDIDATO))
+    
+    votos <- setNames(as.numeric(L$VOTOS_TOTAIS_AGRUPAMENTO), L$AGRUPAMENTO_ID)
+    cands <- lapply(split(C, C$AGRUPAMENTO_ID),
+                    function(d) setNames(as.numeric(d$VOTOS_NOMINAIS_CANDIDATO), d$SQ_CANDIDATO))
+    
+    # (1) Resultado real simulado e validação contra os eleitos do TSE
+    base <- aloca_cadeiras(votos, cands, qe, cad, ano)
+    oficiais <- C$SQ_CANDIDATO[C$DS_SIT_TOT_TURNO %in% situacoes_eleito]
+    sim_validacao[[i]] <- data.frame(ANO_ELEICAO = ano, SG_UF = uf,
+                                     REPRODUZ_OFICIAL = setequal(base$SQ_CANDIDATO, oficiais))
+    sim_eleitos[[i]] <- cbind(ANO_ELEICAO = ano, SG_UF = uf, base)
+    
+    # (2) Contrafactual: para cada lista com puxador, retira o excedente (votos - QE) de
+    #     TODOS os seus puxadores (cada um fica com exatamente 1 QE) e distribui de novo.
+    #     Eleitos da lista que perdem a vaga = puxados. Listas com vários puxadores são
+    #     tratadas em conjunto, para não contar o mesmo puxado duas vezes.
+    P <- C |> filter(VOTOS_NOMINAIS_CANDIDATO >= qe)
+    for (k in unique(P$AGRUPAMENTO_ID)) {
+      Pk <- P |> filter(AGRUPAMENTO_ID == k)
+      votos_cf <- votos
+      votos_cf[[k]] <- votos_cf[[k]] - sum(Pk$VOTOS_NOMINAIS_CANDIDATO - qe)
+      cf <- aloca_cadeiras(votos_cf, cands, qe, cad, ano)
+      perdidos <- setdiff(base$SQ_CANDIDATO[base$AGRUPAMENTO_ID == k],
+                          cf$SQ_CANDIDATO[cf$AGRUPAMENTO_ID == k])
+      puxadores_txt <- paste0(Pk$NM_CANDIDATO, " (", Pk$SG_PARTIDO, ")", collapse = "; ")
+      
+      sim_listas[[length(sim_listas) + 1]] <- data.frame(
+        ANO_ELEICAO = ano, SG_UF = uf, AGRUPAMENTO_ID = k, PUXADORES = puxadores_txt,
+        CADEIRAS_LISTA = sum(base$AGRUPAMENTO_ID == k),
+        CADEIRAS_SEM_EXCEDENTE = sum(cf$AGRUPAMENTO_ID == k),
+        N_PUXADOS = length(perdidos))
+      if (length(perdidos) > 0)
+        sim_puxados[[length(sim_puxados) + 1]] <- data.frame(
+          ANO_ELEICAO = ano, SG_UF = uf, SQ_CANDIDATO = perdidos, PUXADO_POR = puxadores_txt)
+    }
+  }
+  
+  sim_eleitos    <- bind_rows(sim_eleitos)
+  sim_puxados    <- bind_rows(sim_puxados)
+  sim_validacao  <- bind_rows(sim_validacao)
+  puxadores_por_lista <- bind_rows(sim_listas)
+  
+  # A simulação precisa reproduzir os eleitos do TSE em todas as UFs (deve sair vazio)
+  print(filter(sim_validacao, !REPRODUZ_OFICIAL))
+}
+
+# -------------------------------------------------------------------------------------
+# D. TABELA FINAL: UM ELEITO POR LINHA
+# -------------------------------------------------------------------------------------
+{
+  classificacao_eleitos <- eleitos |>
+    left_join(select(quociente_uf, ANO_ELEICAO, SG_UF, QUOCIENTE_ELEITORAL),
+              by = c("ANO_ELEICAO", "SG_UF")) |>
+    left_join(select(corte_uf, ANO_ELEICAO, SG_UF, VOTOS_MAIS_VOTADO_NAO_ELEITO),
+              by = c("ANO_ELEICAO", "SG_UF")) |>
+    left_join(select(sim_eleitos, ANO_ELEICAO, SG_UF, SQ_CANDIDATO, ETAPA, RODADA_SOBRA, MEDIA_SOBRA),
+              by = c("ANO_ELEICAO", "SG_UF", "SQ_CANDIDATO")) |>
+    left_join(sim_puxados, by = c("ANO_ELEICAO", "SG_UF", "SQ_CANDIDATO")) |>
+    group_by(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID) |>
+    mutate(LISTA_TEM_PUXADOR = any(VOTOS_NOMINAIS_CANDIDATO >= QUOCIENTE_ELEITORAL)) |>
+    ungroup() |>
+    mutate(
+      # Forma de eleição pela SIMULAÇÃO (critério principal)
+      FORMA_ELEICAO = case_when(
+        VOTOS_NOMINAIS_CANDIDATO >= QUOCIENTE_ELEITORAL ~ "Puxador",
+        !is.na(PUXADO_POR)                              ~ "Puxado",
+        TRUE                                            ~ "Eleito normalmente"),
+      # Critério do corte (professor): abaixo do não eleito mais votado, em lista com puxador
+      ELEITO_ABAIXO_DE_NAO_ELEITO = VOTOS_NOMINAIS_CANDIDATO < coalesce(VOTOS_MAIS_VOTADO_NAO_ELEITO, 0),
+      FORMA_ELEICAO_CRITERIO_CORTE = case_when(
+        VOTOS_NOMINAIS_CANDIDATO >= QUOCIENTE_ELEITORAL      ~ "Puxador",
+        ELEITO_ABAIXO_DE_NAO_ELEITO & LISTA_TEM_PUXADOR      ~ "Puxado", # Para ser considerado puxado, a lista deve ter um puxador
+        TRUE                                                 ~ "Eleito normalmente"),
+      ETAPA_ELEICAO = if_else(ETAPA == "QP", "QP",
+                              paste0(ETAPA, " - rodada ", RODADA_SOBRA))
+    ) |>
+    # ORDEM DOS ELEITOS PELA QUANTIDADE DE VOTOS
+    # POSICAO_VOTOS_UF:    1º = eleito mais votado da UF ... nº = eleito menos votado da UF
+    # POSICAO_VOTOS_LISTA: mesma ordem, dentro da própria lista (partido/coligação/federação)
+    group_by(ANO_ELEICAO, SG_UF) |>
+    mutate(POSICAO_VOTOS_UF = row_number(desc(VOTOS_NOMINAIS_CANDIDATO)),
+           TOTAL_ELEITOS_UF = n()) |>
+    group_by(ANO_ELEICAO, SG_UF, AGRUPAMENTO_ID) |>
+    mutate(POSICAO_VOTOS_LISTA = row_number(desc(VOTOS_NOMINAIS_CANDIDATO))) |>
+    ungroup() |>
+    arrange(ANO_ELEICAO, SG_UF, POSICAO_VOTOS_UF) |>
+    select(ANO_ELEICAO, SQ_CANDIDATO,
+           NOME_COMPLETO = NM_CANDIDATO, PARTIDO = SG_PARTIDO, UF = SG_UF,
+           FORMA_ELEICAO, PUXADO_POR,
+           POSICAO_VOTOS_UF, TOTAL_ELEITOS_UF, POSICAO_VOTOS_LISTA,
+           VOTOS_NOMINAIS_CANDIDATO, ETAPA_ELEICAO, MEDIA_SOBRA,
+           FORMA_ELEICAO_CRITERIO_CORTE, ELEITO_ABAIXO_DE_NAO_ELEITO)
+  
+  # Junta à planilha final e reordena do 1º ao último eleito de cada UF
+  planilha_deputados_final <- planilha_deputados_final |>
+    left_join(
+      select(classificacao_eleitos, ANO_ELEICAO, SG_UF = UF, SQ_CANDIDATO,
+             FORMA_ELEICAO, PUXADO_POR, POSICAO_VOTOS_UF, POSICAO_VOTOS_LISTA,
+             ETAPA_ELEICAO, MEDIA_SOBRA, FORMA_ELEICAO_CRITERIO_CORTE, ELEITO_ABAIXO_DE_NAO_ELEITO),
+      by = c("ANO_ELEICAO", "SG_UF", "SQ_CANDIDATO")
+    ) |>
+    arrange(ANO_ELEICAO, SG_UF, POSICAO_VOTOS_UF)
+  stopifnot(!anyNA(planilha_deputados_final$FORMA_ELEICAO))
+  
+  # Resumo por ano: as duas medidas lado a lado
+  resumo_puxadores <- classificacao_eleitos |>
+    group_by(ANO_ELEICAO) |>
+    summarise(
+      PUXADORES = sum(FORMA_ELEICAO == "Puxador"),
+      LISTAS_COM_PUXADO = n_distinct(PUXADO_POR, na.rm = TRUE),
+      PUXADOS_SIMULACAO = sum(FORMA_ELEICAO == "Puxado"),
+      PUXADOS_CRITERIO_CORTE = sum(FORMA_ELEICAO_CRITERIO_CORTE == "Puxado"),
+      ELEITOS_ABAIXO_DO_CORTE = sum(ELEITO_ABAIXO_DE_NAO_ELEITO),
+      .groups = "drop")
+  print(resumo_puxadores)
+}
